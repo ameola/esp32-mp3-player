@@ -35,7 +35,7 @@
 #define TOUCH_INVERT_Y false
 
 // Album art downloads: MusicBrainz asks every program to identify itself.
-#define ART_USER_AGENT "MP3Player-ESP32/0.1 (personal music player)"
+#define ART_USER_AGENT "MP3Player-ESP32/0.1 ( https://github.com/ameola )"
 
 #define VOLUME_STEPS 10
 #define DEFAULT_VOLUME 4
