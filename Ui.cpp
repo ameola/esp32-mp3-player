@@ -14,6 +14,7 @@
 #include "UiFont.h"
 #include "UiTheme.h"
 #include "WifiSetup.h"
+#include <Preferences.h>
 #include "ThumbStore.h"
 
 // ================================================================ Navigation model
@@ -108,6 +109,84 @@ static bool ctxSong(const PlayContext &c, uint32_t i, uint32_t &id) {
     case CTX_SONG_IDS: id = c.start + i; return true;
     case CTX_NONE_IDX: return Catalog::noneSong(c.start + i, id);
     default: return false;
+  }
+}
+
+// ---------------------------------------------------------------- Shuffle and repeat
+// Shuffle visits every song of the play context once, in a random order that
+// starts at the song chosen. The order is a keyed permutation (a 4-round
+// Feistel network over the next power of 4, cycle-walked into range), so it
+// costs no memory however long the list, and runs backwards for "previous".
+enum RepeatMode : uint8_t { REPEAT_OFF, REPEAT_ALL, REPEAT_ONE };
+static bool shuffleOn = false;
+static uint8_t repeatMode = REPEAT_OFF;
+static uint32_t shuffleSeed = 1, shuffleOffset = 0, shufflePos = 0;
+
+static uint32_t mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352d;
+  x ^= x >> 15;
+  x *= 0x846ca68b;
+  x ^= x >> 16;
+  return x;
+}
+
+static uint32_t feistel(uint32_t v, int half, bool inverse) {
+  const uint32_t mask = (1u << half) - 1;
+  uint32_t l = v >> half, r = v & mask;
+  for (int i = 0; i < 4; i++) {
+    const int round = inverse ? 3 - i : i;
+    if (!inverse) {
+      const uint32_t t = l ^ (mix32(r ^ shuffleSeed ^ round * 0x9e3779b9u) & mask);
+      l = r;
+      r = t;
+    } else {
+      const uint32_t t = r ^ (mix32(l ^ shuffleSeed ^ round * 0x9e3779b9u) & mask);
+      r = l;
+      l = t;
+    }
+  }
+  return l << half | r;
+}
+
+// The permutation of 0..n-1 (and its inverse).
+static uint32_t shuffleMap(uint32_t i, uint32_t n, bool inverse) {
+  int half = 1;
+  while ((1u << (2 * half)) < n) half++;
+  uint32_t v = i;
+  do {
+    v = feistel(v, half, inverse);
+  } while (v >= n);
+  return v;
+}
+
+// Shuffled position p -> index in the play context.
+static uint32_t shuffledIndex(uint32_t p, uint32_t n) {
+  return shuffleMap((p + shuffleOffset) % n, n, false);
+}
+
+// A new order that starts at `index`.
+static void reshuffle(uint32_t index, uint32_t n) {
+  shuffleSeed = mix32(esp_random() | 1);
+  shuffleOffset = n ? shuffleMap(index, n, true) : 0;
+  shufflePos = 0;
+}
+
+static void savePlayModes() {
+  Preferences p;
+  if (p.begin("play", false)) {
+    p.putBool("shuffle", shuffleOn);
+    p.putUChar("repeat", repeatMode);
+    p.end();
+  }
+}
+
+static void loadPlayModes() {
+  Preferences p;
+  if (p.begin("play", true)) {
+    shuffleOn = p.getBool("shuffle", false);
+    repeatMode = min<uint8_t>(p.getUChar("repeat", REPEAT_OFF), REPEAT_ONE);
+    p.end();
   }
 }
 
@@ -1286,6 +1365,7 @@ void uiShowPlayer() {
   static bool initialized = false;
   if (!initialized) {
     resetTabs();
+    loadPlayModes();
     initialized = true;
   }
   if (!scrollAreaSet) {
@@ -1390,6 +1470,9 @@ static void drawNowControls() {
   drawDot(SCREEN_W / 2, cy, 23, pal.accent, pal.bg);
   uiDrawIcon(ICONS_24, audioState() == PLAYING ? ICON_PAUSE : ICON_PLAY, SCREEN_W / 2 - 12, cy - 12, pal.onAccent);
   uiDrawIcon(ICONS_24, ICON_NEXT, SCREEN_W - 54 - 24, cy - 12, pal.text);
+  uiDrawIcon(ICONS_18, ICON_SHUFFLE, 14, cy - 9, shuffleOn ? pal.accent : pal.faint);
+  uiDrawIcon(ICONS_18, ICON_REPEAT, SCREEN_W - 14 - 18, cy - 9, repeatMode ? pal.accent : pal.faint);
+  if (repeatMode == REPEAT_ONE) uiDrawText(FONT_LABEL, "1", SCREEN_W - 14 - 2, cy + 12, pal.accent);
   lcdBlit(0, NP_CTRL_Y, SCREEN_W, NP_CTRL_H);
 }
 
@@ -1501,6 +1584,7 @@ static void playFromLevel(const Level &l, uint32_t songIndex) {
   playCtx = levelContext(l);
   playFromTitle = l.title;
   playIndex = songIndex;
+  reshuffle(songIndex, playCtx.count);
   startPlayback();
 }
 
@@ -1526,9 +1610,45 @@ static void togglePlayPause() {
   refreshPlaying();
 }
 
+// Moves playIndex to the next song (shuffled order if on). At the end of
+// the list: wraps if `wrap`, else returns false.
+static bool stepForward(bool wrap) {
+  const uint32_t n = playCtx.count;
+  if (playIndex < 0 || n == 0) return false;
+  if (shuffleOn) {
+    if (shufflePos + 1 >= n) {
+      if (!wrap) return false;
+      // A fresh order for the next round, not starting with the song that just played.
+      const int32_t last = playIndex;
+      reshuffle(esp_random() % n, n);
+      if (n > 1 && static_cast<int32_t>(shuffledIndex(0, n)) == last) shufflePos = 1;
+      playIndex = shuffledIndex(shufflePos, n);
+      return true;
+    }
+    playIndex = shuffledIndex(++shufflePos, n);
+    return true;
+  }
+  if (static_cast<uint32_t>(playIndex) + 1 >= n) {
+    if (!wrap) return false;
+    playIndex = 0;
+    return true;
+  }
+  playIndex++;
+  return true;
+}
+
+static void stepBack() {
+  const uint32_t n = playCtx.count;
+  if (shuffleOn) {
+    shufflePos = shufflePos == 0 ? n - 1 : shufflePos - 1;
+    playIndex = shuffledIndex(shufflePos, n);
+  } else {
+    playIndex = playIndex == 0 ? n - 1 : playIndex - 1;
+  }
+}
+
 static void nextTrack() {
-  if (playIndex >= 0 && playCtx.count > 0) {
-    playIndex = (playIndex + 1) % playCtx.count;
+  if (stepForward(true)) {
     startPlayback();
   }
 }
@@ -1539,19 +1659,31 @@ static void previousTrack() {
   }
   // Restart the current song if we're more than a few seconds in.
   if (!(audioState() != STOPPED && audioFilePos() > 64 * 1024)) {
-    playIndex = playIndex == 0 ? playCtx.count - 1 : playIndex - 1;
+    stepBack();
   }
   startPlayback();
 }
 
 static void handleTrackEnded() {
   Serial.println("Track finished");
-  if (playIndex >= 0 && static_cast<uint32_t>(playIndex) + 1 < playCtx.count) {
-    playIndex++;
+  if (repeatMode == REPEAT_ONE && playIndex >= 0) {
+    startPlayback();
+  } else if (stepForward(repeatMode == REPEAT_ALL)) {
     startPlayback();
   } else {
     refreshPlaying();
   }
+}
+
+static void toggleShuffle() {
+  shuffleOn = !shuffleOn;
+  if (shuffleOn && playIndex >= 0) reshuffle(playIndex, playCtx.count);  // continue from this song
+  savePlayModes();
+}
+
+static void cycleRepeat() {
+  repeatMode = (repeatMode + 1) % 3;
+  savePlayModes();
 }
 
 static void scrollTo(int32_t top) {
@@ -1703,9 +1835,13 @@ static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
   if (y < NP_HEADER_H + 6) {
     if (x < 48) closeNow();
   } else if (y >= NP_CTRL_Y && y < NP_CTRL_Y + NP_CTRL_H) {
-    if (x >= 36 && x < 92) previousTrack();
-    else if (x >= 92 && x < 148) togglePlayPause();
-    else if (x >= 148 && x < 204) nextTrack();
+    if (x < 40) toggleShuffle();
+    else if (x < 92) previousTrack();
+    else if (x < 148) togglePlayPause();
+    else if (x < 200) nextTrack();
+    else cycleRepeat();
+    NowDraw unmute;
+    drawNowControls();
   } else if (y >= NP_VOL_Y - 4) {
     volumeDrag = true;
     setVolumeAt(x);
@@ -1788,6 +1924,7 @@ void uiLibraryChanged() {
     if (Catalog::findTitlePos(currentPath, current.title, pos)) {
       playCtx = {CTX_TITLE, 0, Catalog::titleCount()};
       playIndex = pos;
+      reshuffle(pos, playCtx.count);
       uint32_t id;
       if (Catalog::titleSong(pos, id)) {
         Catalog::song(id, current);
