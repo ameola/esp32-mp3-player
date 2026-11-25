@@ -19,11 +19,16 @@
 // holds those lines driven at all times (and avoids start/stop pops).
 static volatile PlayerState state = STOPPED;
 static volatile uint32_t underruns = 0;
+// Samples handed to the DMA ring since the song started. Until the first
+// ring's worth is in, a dry ring only means the song hasn't begun (the ring
+// holds silence): not an audible gap, so not counted.
+static volatile uint32_t trackSamples = 0;
+static uint32_t ringSamples = 0;
 
 // The DMA ring played out completely before new samples arrived (an audible
 // gap). Silence while stopped or paused does the same, so only count playback.
 static bool IRAM_ATTR onSendQueueOverflow(i2s_chan_handle_t, i2s_event_data_t *, void *) {
-  if (state == PLAYING) {
+  if (state == PLAYING && trackSamples > ringSamples) {
     underruns = underruns + 1;
   }
   return false;
@@ -35,6 +40,7 @@ public:
     if (!started) {
       started = AudioOutputI2S::begin();
       if (started) {  // callbacks can only be registered on a disabled channel
+        ringSamples = _buffers * _bufferWords;
         i2s_channel_disable(_tx_handle);
         i2s_event_callbacks_t callbacks = {};
         callbacks.on_send_q_ovf = onSendQueueOverflow;
@@ -120,6 +126,7 @@ private:
     size_t written = 0;
     i2s_channel_write(_tx_handle, stage, pending * sizeof(uint32_t), &written, 0);
     const size_t n = written / sizeof(uint32_t);
+    trackSamples = trackSamples + n;
     if (n) {
       memmove(stage, stage + n, (pending - n) * sizeof(uint32_t));
       pending -= n;
@@ -487,6 +494,7 @@ bool audioPlay(const char *path, uint32_t startOffset) {
   if (!ensureEngine()) return false;
   AudioLock held;
   trackEnded = false;
+  trackSamples = 0;
   currentPath = path;
   if (audioFile->open(path) &&
       (startOffset == 0 || startOffset >= audioFile->getSize() ||
