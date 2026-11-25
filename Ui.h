@@ -21,6 +21,8 @@ void uiShowProgress(bool redraw, const char *title, const char *phase, float fra
 // True once after the library status corner (top right) was held for 2 s:
 // the user asked for a full rebuild.
 bool uiTakeRebuildRequest();
+// True once after Settings > WiFi network was tapped: show the WiFi setup.
+bool uiTakeWifiSetupRequest();
 
 // Library status in the tab bar's right corner: up to two short lines
 // separated by '\n' (e.g. "Tags\n45%"); "" to clear.

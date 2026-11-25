@@ -27,6 +27,7 @@
 #include "Library.h"
 #include "Touch.h"
 #include "Ui.h"
+#include "UiTheme.h"
 #include "CardSettings.h"
 #include "WifiSetup.h"
 
@@ -362,6 +363,7 @@ void setup() {
   Serial.begin(115200);
   memLog = "[mem] setup start    free " + String(heapAtStart) + "\n";
   memStep("audio");
+  uiStyleLoad();  // theme and layout settings, before anything is drawn
   lcdInit();
   memStep("lcd");
   touchInit();
@@ -425,6 +427,11 @@ void loop() {
     uiTick();
     if (uiTakeRebuildRequest()) {
       startFullRebuild();
+    }
+    if (uiTakeWifiSetupRequest()) {
+      artFetchStop();
+      appState = WIFI_SETUP;
+      wifiSetupBegin();
     }
   }
 }

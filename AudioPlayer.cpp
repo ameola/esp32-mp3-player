@@ -45,8 +45,34 @@ public:
     return started;
   }
   bool stop() override {
-    flush();  // fill the DMA ring with silence instead of shutting down
+    silence();  // fill the DMA ring with silence instead of shutting down
     return true;
+  }
+
+  // Leaves the DMA ring holding nothing but zeros. When nothing new is
+  // written the I2S hardware keeps cycling through the ring, replaying what
+  // it holds: the library's flush() pushed its zeros through the staging
+  // buffer, so up to STAGE_SAMPLES of the song could stay in the ring and
+  // repeat as a buzz while paused. Here the staged samples go out first,
+  // then a whole ring of zeros (plus margin), waiting for room.
+  void silence() {
+    if (!i2sOn) return;
+    for (int tries = 0; pending && tries < 50; tries++) {
+      drain();
+      if (pending) delay(2);
+    }
+    pending = 0;
+    static const uint32_t zeros[64] = {};
+    size_t frames = _buffers * _bufferWords + STAGE_SAMPLES;
+    while (frames) {
+      size_t written = 0;
+      const size_t n = frames < 64 ? frames : 64;
+      if (i2s_channel_write(_tx_handle, zeros, n * sizeof(uint32_t), &written, pdMS_TO_TICKS(200)) != ESP_OK ||
+          !written) {
+        break;
+      }
+      frames -= written / sizeof(uint32_t);
+    }
   }
 
   // The library hands each sample to the I2S driver with its own
@@ -476,7 +502,7 @@ bool audioPlay(const char *path, uint32_t startOffset) {
 void audioPause() {
   AudioLock held;
   if (state == PLAYING) {
-    audioOut->flush();  // fill I2S DMA with silence so the pause doesn't buzz
+    audioOut->silence();  // only zeros in the DMA ring, so the pause doesn't buzz
     state = PAUSED;
   }
 }

@@ -30,7 +30,8 @@ void close();
 bool isOpen();
 uint32_t generation();
 
-uint32_t songCount();
+uint32_t songCount();   // every song file (ids 0..songCount-1)
+uint32_t titleCount();  // songs in the lists (title.idx): duplicates left out
 bool song(uint32_t id, Track &out);
 String songPath(uint32_t id);  // Arduino-style path on the card
 

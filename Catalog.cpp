@@ -92,6 +92,10 @@ String songPath(uint32_t id) {
   return readName(f.pathOffset, f.pathLen) + "/" + readName(r.nameOffset, r.nameLen);
 }
 
+uint32_t titleCount() {
+  return isOpen() ? titles.count() : 0;
+}
+
 bool titleSong(uint32_t pos, uint32_t &id) {
   return isOpen() && titles.read(pos, &id);
 }

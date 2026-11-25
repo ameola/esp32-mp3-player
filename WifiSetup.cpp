@@ -11,7 +11,8 @@
 namespace {
 
 // ---------------------------------------------------------------- layout
-#define WS_INTRO_Y HEADER_H          // 46: two lines of explanation
+#define WS_HEADER_H 46               // its own header (the player's is 32)
+#define WS_INTRO_Y WS_HEADER_H       // 46: two lines of explanation
 #define WS_ROWS_Y 90                 // network rows
 #define WS_ROW_H 32
 #define WS_ROWS 5                    // 90 .. 250
@@ -77,7 +78,7 @@ void button(int16_t x, int16_t w, int16_t h, const char *label, bool pressed, bo
 void drawHeader(const char *title) {
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_HEADER);
   text(title, 8, 15, 2, C_TEXT);
-  lcdBlit(0, 0, SCREEN_W, HEADER_H);
+  lcdBlit(0, 0, SCREEN_W, WS_HEADER_H);
 }
 
 void drawTwoLines(int16_t y, const String &a, const String &b, uint16_t colorA = C_DIM) {
@@ -163,7 +164,7 @@ void drawListButtons() {
 void showList() {
   screen = S_LIST;
   pressedNet = -1;
-  lcdFillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H, C_BG);
+  lcdFillRect(0, WS_HEADER_H, SCREEN_W, SCREEN_H - WS_HEADER_H, C_BG);
   drawHeader("Album art");
   drawTwoLines(WS_INTRO_Y, "Pick a WiFi network so the player can", "download album art. Or tap Skip.", C_TEXT);
   for (int r = 0; r < WS_ROWS; r++) drawNetRow(r);
@@ -270,7 +271,7 @@ void showPassword(const char *note = nullptr) {
   screen = S_PASSWORD;
   buttonCount = 0;
   pressedRow = pressedKey = -1;
-  lcdFillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H, C_BG);
+  lcdFillRect(0, WS_HEADER_H, SCREEN_W, SCREEN_H - WS_HEADER_H, C_BG);
   drawHeader("WiFi password");
   drawTwoLines(WS_INTRO_Y, note ? note : "Password for", display(chosen), note ? C_ACCENT : C_DIM);
   drawField();
@@ -280,7 +281,7 @@ void showPassword(const char *note = nullptr) {
 // ---------------------------------------------------------------- connecting
 void connectTo(const String &ssid, const String &pass) {
   screen = S_CONNECTING;
-  lcdFillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H, C_BG);
+  lcdFillRect(0, WS_HEADER_H, SCREEN_W, SCREEN_H - WS_HEADER_H, C_BG);
   drawHeader("Album art");
   drawTwoLines(120, "Connecting to", display(ssid));
   setButtons({"Cancel"});
@@ -293,7 +294,7 @@ void connectTo(const String &ssid, const String &pass) {
 
 void showMessage(const char *a, const String &b, uint32_t ms, Screen next, WifiSetupResult r = WS_RUNNING) {
   screen = S_MESSAGE;
-  lcdFillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H, C_BG);
+  lcdFillRect(0, WS_HEADER_H, SCREEN_W, SCREEN_H - WS_HEADER_H, C_BG);
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
   centered(a, SCREEN_W / 2, 6, 2, C_TEXT);
   centered(fitText(b, 38), SCREEN_W / 2, 30, 1, C_DIM);

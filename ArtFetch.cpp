@@ -1108,6 +1108,10 @@ void artFetchInit() {
   audioSetBeforeRestore(artFetchStop);
 }
 
+bool artFetchEnabled() {
+  return enabled;
+}
+
 void artFetchSetEnabled(bool on) {
   enabled = on;
 }

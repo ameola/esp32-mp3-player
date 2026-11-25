@@ -13,6 +13,7 @@
 
 void artFetchInit();                  // once, in setup()
 void artFetchSetEnabled(bool on);     // per-card setting (CardSettings)
+bool artFetchEnabled();
 // Call every loop while the player screen is up: starts a pass when the
 // player has been idle for a while and the library isn't being updated.
 void artFetchTick();

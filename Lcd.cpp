@@ -188,6 +188,10 @@ void lcdBlit(int16_t dstX, int16_t dstY, int16_t w, int16_t h) {
 }
 
 void lcdBlitFrom(int16_t fromY, int16_t dstX, int16_t dstY, int16_t w, int16_t h) {
+  // Never read past the canvas: a band taller than it would send whatever
+  // memory follows (garbage on screen).
+  h = min<int16_t>(h, canvas->height() - fromY);
+  if (h <= 0) return;
   int16_t x = dstX, y = dstY, cw = w, ch = h;
   if (muted || !lcdSetWindow(x, y, cw, ch)) {
     return;
