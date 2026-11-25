@@ -9,6 +9,7 @@
 #include "Lcd.h"
 #include "LibFormat.h"
 #include "LibStore.h"
+#include "LyricStore.h"
 #include "Text.h"
 #include "CardSettings.h"
 #include "Keyboard.h"
@@ -234,14 +235,14 @@ static bool isPlaying(uint32_t songId) {
 // action runs on a tap, and an information row shows a value.
 enum SettingId : uint8_t {
   S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP, S_LYRICS,  // Display
-  S_WIFI, S_ART, S_ART_NOW,                                       // WiFi & album art
+  S_WIFI, S_ART, S_ART_NOW,                                       // WiFi & downloads
   S_SONGS, S_ARTISTS, S_ALBUMS, S_REBUILD,                        // Library
   S_VERSION, S_BOARD, S_MEMORY, S_CARD, S_UPTIME,                 // System
   SETTING_COUNT
 };
 enum SettingGroup : uint8_t { G_DISPLAY, G_WIFI, G_LIBRARY, G_SYSTEM, GROUP_COUNT };
 static const uint8_t kGroupFirst[GROUP_COUNT + 1] = {S_THEME, S_WIFI, S_SONGS, S_VERSION, SETTING_COUNT};
-static const char *const kGroupNames[GROUP_COUNT] = {"Display", "WiFi & album art", "Library", "System"};
+static const char *const kGroupNames[GROUP_COUNT] = {"Display", "WiFi & downloads", "Library", "System"};
 static const uint16_t kGroupIcons[GROUP_COUNT] = {ICON_PALETTE, ICON_WIFI, ICON_MUSIC_NOTE, ICON_MEMORY};
 
 static uint32_t rebuildArmedAt = 0;  // first tap on "Rebuild library"; a second within 4 s starts it
@@ -296,7 +297,7 @@ static uint8_t choiceCurrent(uint32_t id) {
 static const char *settingLabel(uint32_t id) {
   static const char *const labels[SETTING_COUNT] = {
     "Theme", "Density", "Text size", "Corners", "Brightness", "Screen off after", "Lyrics",
-    "WiFi network", "Album art downloads", "Download now",
+    "WiFi network", "Art & lyrics downloads", "Download now",
     "Songs", "Artists", "Albums", "Rebuild library",
     "Version", "Board", "Free memory", "SD card", "Running for"};
   return id < SETTING_COUNT ? labels[id] : "";
@@ -316,7 +317,7 @@ static String settingValue(uint32_t id) {
   if (choiceCount(id)) return choiceName(id, choiceCurrent(id));
   switch (id) {
     case S_WIFI: return wifiSsid.length() ? wifiSsid : String("Not set up");
-    case S_ART_NOW: return artFetchRunning() ? "Downloading..." : "Find missing covers and photos";
+    case S_ART_NOW: return artFetchRunning() ? "Downloading..." : "Find missing covers, photos, lyrics";
     case S_REBUILD: return rebuildArmedAt ? "Tap again to rebuild" : "Re-reads every song's tags";
     case S_SONGS: return formatCount(Catalog::titleCount());
     case S_ARTISTS: return formatCount(Catalog::artistCount());
@@ -1972,8 +1973,22 @@ static bool parseStamp(const char *s, size_t n, uint32_t &ms) {
   return true;
 }
 
-// Loads and wraps the playing song's lyrics (none: lyricCount 0).
+static LyricKind lyricKind = LYR_NOT_LOOKED;  // what's known of the playing song's
+static uint32_t lyricsSavedSeen = 0;          // artLyricsSaved() when it was loaded
+
+// The download key: track artist (else album artist) and title, as the pass
+// looks songs up.
+static uint32_t lyricsKeyOf(const Track &t) {
+  return LyricStore::key(t.artist.length() ? t.artist : t.albumArtist, t.title);
+}
+
+static void lyricsParse(const String &text);
+
+// Loads and wraps the playing song's lyrics (none: lyricCount 0): an .lrc
+// file next to the song first, else downloaded ones.
 static void lyricsLoad() {
+  lyricKind = LYR_NOT_LOOKED;
+  lyricsSavedSeen = artLyricsSaved();
   lyricsFree();
   lyricSongId = current.id;
   lyricShown = -2;
@@ -1989,10 +2004,18 @@ static void lyricsLoad() {
       break;
     }
   }
-  if (!open) {
+  String text;
+  if (!open) {  // downloaded ones (LyricStore), else ask the next idle pass for them
     cardDeleteFil(fil);
+    lyricKind = LyricStore::find(lyricsKeyOf(current), &text);
+    if (lyricKind == LYR_NOT_LOOKED && uiStyle.lyrics) artLyricsWant(current.id);
+    // Known but not read (no memory during a download's TLS handshake):
+    // tried again when the pass saves its next song.
+    if ((lyricKind == LYR_SYNCED || lyricKind == LYR_PLAIN) && !text.length()) lyricKind = LYR_NOT_LOOKED;
+    if (text.length()) lyricsParse(text);
     return;
   }
+  lyricKind = LYR_SYNCED;  // a file of ours: what it holds decides
   const UINT size = min<UINT>(f_size(fil), LYRICS_MAX_FILE);
   char *raw = static_cast<char *>(malloc(size + 1));
   UINT got = 0;
@@ -2005,7 +2028,6 @@ static void lyricsLoad() {
     return;
   }
   // Text as UTF-8: Latin-1 files converted.
-  String text;
   if (validUtf8(raw, got)) {
     text = raw;
   } else {
@@ -2018,6 +2040,11 @@ static void lyricsLoad() {
   }
   free(raw);
   if (text.startsWith("\xEF\xBB\xBF")) text.remove(0, 3);  // byte order mark
+  lyricsParse(text);
+}
+
+// Timed or plain lyrics text (UTF-8) into wrapped lines.
+static void lyricsParse(const String &text) {
 
   // Pass 1: entries (time, text) in file order.
   struct Entry {
@@ -2122,7 +2149,7 @@ static void drawLyrics(bool force) {
     if (!lyricCount) {
       if (band == 2 * LYRIC_H) {
         drawCentered(FONT_BODY, "No lyrics for this song", SCREEN_W / 2, 16, pal.dim);
-        drawCentered(FONT_SMALL, "An .lrc file next to the MP3 shows here", SCREEN_W / 2, 34, pal.faint);
+        drawCentered(FONT_SMALL, "They download while the player is idle", SCREEN_W / 2, 34, pal.faint);
       }
     } else {
       for (int k = 0; k < 2; k++) {
@@ -3021,5 +3048,11 @@ void uiTick() {
       }
     }
     if (!nowOpen && wifiState() != wifiShown && !listMoving()) drawHeader();
+    // The playing song's lyrics just downloaded: load them.
+    if (!lyricCount && lyricKind == LYR_NOT_LOOKED && lyricSongId == current.id &&
+        artLyricsSaved() != lyricsSavedSeen) {
+      lyricSongId = LIB_NONE;
+      if (nowOpen) drawNow();
+    }
   }
 }

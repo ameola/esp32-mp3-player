@@ -1,6 +1,7 @@
 #pragma once
 // Album art downloads (MusicBrainz search, Cover Art Archive 250 px front
-// cover) and artist photos (Deezer search, 250 px) into
+// cover), artist photos (Deezer search, 250 px) and, with Lyrics on,
+// songs' lyrics (LRCLIB, into LyricStore). Pictures go into
 // LIB_DIR "/art/xx/<key>.jpg"; albums and artists without one get a
 // "<key>.no" marker, retried after 30 days. <key> is a hash of album artist
 // and album name, so the cache survives library rebuilds.
@@ -23,6 +24,12 @@ void artFetchNow();                   // start a pass without waiting (Serial "a
 void artFetchArtistsNow();
 void artFetchStop();                  // blocks until WiFi is off again
 bool artFetchRunning();
+// Asks for a song's lyrics first in the next pass (the playing song, when
+// it has none yet). Passes still only run while no music plays.
+void artLyricsWant(uint32_t songId);
+// Goes up each time a pass saves lyrics (the player reloads the playing
+// song's).
+uint32_t artLyricsSaved();
 // Progress for the status corner ("Art\n12%"), "" when not running.
 String artFetchStatus();
 // Thumbnail keys (ThumbStore) of an album's cover and an artist's photo; 0

@@ -1,6 +1,7 @@
 #include "ArtFetch.h"
 
 #include <atomic>
+#include <functional>
 #include <esp_crt_bundle.h>
 #include <esp_event.h>
 #include <esp_heap_caps.h>
@@ -19,9 +20,11 @@
 #include "LibFormat.h"
 #include "LibClean.h"
 #include "LibStore.h"
+#include "LyricStore.h"
 #include "Library.h"
 #include "Text.h"
 #include "ThumbStore.h"
+#include "UiTheme.h"
 #include "WifiSetup.h"
 
 namespace {
@@ -35,6 +38,12 @@ namespace {
 #define MB_INTERVAL_MS 2000
 // Deezer (artist photos) allows 50 requests per 5 seconds.
 #define DZ_INTERVAL_MS 500
+// LRCLIB (lyrics): after a burst of about 60 requests it answers every
+// other one 429 at 0.6 s apart. The gap starts short and grows on a 429.
+#define LRC_INTERVAL_MS 250
+#define LRC_INTERVAL_MAX_MS 3000
+#define LYRICS_MAX 12288             // longest text kept (as the player reads .lrc files)
+#define WANT_MAX 8                   // songs to look up lyrics for first
 #define MIN_FREE_FOR_WIFI 90000      // WiFi ~43 KB + TLS ~45 KB
 #define HTTP_TIMEOUT_MS 5000         // also bounds how long a stop request waits
 #define TASK_STACK 8192              // TLS handshake runs on it
@@ -43,7 +52,10 @@ namespace {
 // to back they made each of its thumbnail reads take 30-70 ms, not 5-10.
 #define CARD_PAUSE_MS 10
 
-enum Outcome { O_SAVED, O_NONE, O_NET_ERROR, O_STOPPED };
+// O_SKIPPED: the search answered but the picture's host couldn't be read
+// (archive.org's HTTPS nodes need more memory than the player has while
+// its UI runs); tried again next pass, and not a network failure.
+enum Outcome { O_SAVED, O_NONE, O_NET_ERROR, O_STOPPED, O_SKIPPED };
 
 bool enabled = false;
 TaskHandle_t task = nullptr;
@@ -54,12 +66,20 @@ uint32_t retryAt = 0;
 uint32_t cursor = 0;              // next album to look at (survives stopped passes)
 uint32_t cursorGen = LIB_NONE;    // generation the cursor belongs to
 uint32_t finishedGen = LIB_NONE;  // every album of this generation was handled
+uint32_t cursorSongs = 0;          // songs (lyrics steps) ahead of the pictures when the cursor was set
 bool albumsSkipped = false;       // artFetchArtistsNow: this pass started past the albums
 uint32_t lastMbRequest = 0;
 uint32_t lastDzRequest = 0;
 ThumbStore store;  // the pass's handle (the UI has its own)
 uint16_t thumbPixels[ART_THUMB * ART_THUMB];
 uint32_t passGen = LIB_NONE;
+std::atomic<uint32_t> picturesFrom{0};  // cursor where the picture steps begin (after lyrics)
+std::atomic<uint32_t> lyricsSaved{0};
+// Songs whose lyrics the player asked for (the playing one): first.
+portMUX_TYPE wantLock = portMUX_INITIALIZER_UNLOCKED;
+uint32_t wanted[WANT_MAX];
+uint8_t wantCount = 0;
+uint32_t wantGen = LIB_NONE;
 
 uint32_t freeHeap() { return heap_caps_get_free_size(MALLOC_CAP_8BIT); }
 
@@ -766,7 +786,7 @@ Outcome fetchAlbum(uint32_t key, const String &album, const String &artist) {
     return writeMarker(key) ? O_NONE : O_NET_ERROR;
   }
   Serial.printf("[art]   cover failed: HTTP %d after %lu ms; free %u\n", status, millis() - t0, freeHeap());
-  return O_NET_ERROR;
+  return status == 0 ? O_SKIPPED : O_NET_ERROR;
 }
 
 // One Deezer artist search. Returns the HTTP status, -1 if stopped.
@@ -957,6 +977,269 @@ bool migrateKeys(LibReader &albums, LibReader &artists) {
   return true;
 }
 
+
+// ---------------------------------------------------------------- lyrics
+// LRCLIB's /api/get: artist, title and length (within 2 s) pick a song; 404
+// if it has none. The answer is one flat JSON object with the lyrics twice
+// (plain and timed) and more: up to ~35 KB, read as it streams in, keeping
+// the timed text if there is any, else the plain one. The text goes
+// straight into the store's file (no room for a 12 KB buffer next to TLS):
+// timed text, which comes after the plain one, is written over it.
+class LyricsReader {
+ public:
+  uint32_t base = 0;     // where the text starts in the store
+  uint16_t len = 0;      // its length once finish()ed
+  bool synced = false, instrumental = false, writeFailed = false;
+
+  void reset() {
+    base = LyricStore::textStart();
+    restart();
+    writeFailed = false;
+    synced = instrumental = false;
+    depth = 0;
+    inString = escaped = afterColon = false;
+    target = T_NONE;
+    key = "";
+    scalar = "";
+    uLeft = 0;
+  }
+  void feed(const uint8_t *d, int n) {
+    for (int i = 0; i < n; i++) step(static_cast<char>(d[i]));
+  }
+  // The kept text, without trailing blank lines; cut after its last whole
+  // line if it was too long.
+  void finish() {
+    flush();
+    len = full ? contentAtNewline : content;
+  }
+
+ private:
+  enum Target { T_NONE, T_KEY, T_PLAIN, T_SYNCED, T_SKIP };
+  int depth = 0;
+  bool inString = false, escaped = false, afterColon = false, full = false;
+  Target target = T_NONE;
+  String key, scalar;
+  char stage[256];
+  uint16_t staged = 0, written = 0, content = 0, contentAtNewline = 0;
+
+  void restart() {  // a text starts (again) at base
+    len = staged = written = content = contentAtNewline = 0;
+    full = false;
+  }
+  void flush() {
+    if (staged && !writeFailed) writeFailed = !LyricStore::writeText(base + written, stage, staged);
+    written += staged;
+    staged = 0;
+  }
+  uint32_t uValue = 0, uHigh = 0;
+  uint8_t uLeft = 0;
+
+  void put(char c) {
+    if (target == T_KEY) {
+      if (key.length() < 24) key += c;
+      return;
+    }
+    if (target != T_PLAIN && target != T_SYNCED) return;
+    if (c == '\r' || full) return;
+    if (len >= LYRICS_MAX) {
+      full = true;
+      return;
+    }
+    stage[staged++] = c;
+    len++;
+    if (c == '\n') contentAtNewline = content;
+    else if (c != ' ') content = len;
+    if (staged == sizeof(stage)) flush();
+  }
+  void putCodepoint(uint32_t cp) {
+    String s;
+    appendCodepoint(s, cp);
+    for (size_t i = 0; i < s.length(); i++) put(s[i]);
+  }
+  void step(char c) {
+    if (inString) {
+      if (uLeft) {
+        uValue = uValue << 4 | (isdigit(static_cast<unsigned char>(c)) ? c - '0' : (tolower(c) - 'a' + 10) & 15);
+        if (--uLeft == 0) {
+          if (uValue >= 0xD800 && uValue < 0xDC00) uHigh = uValue;
+          else if (uValue >= 0xDC00 && uValue < 0xE000 && uHigh) putCodepoint(0x10000 + ((uHigh - 0xD800) << 10) + (uValue - 0xDC00)), uHigh = 0;
+          else putCodepoint(uValue), uHigh = 0;
+        }
+      } else if (escaped) {
+        escaped = false;
+        switch (c) {
+          case 'n': put('\n'); break;
+          case 't': put(' '); break;
+          case 'r': case 'b': case 'f': break;
+          case 'u': uLeft = 4; uValue = 0; break;
+          default: put(c); break;
+        }
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+        if (target == T_KEY) afterColon = false;
+        target = T_NONE;
+      } else {
+        put(c);
+      }
+      return;
+    }
+    switch (c) {
+      case '{': case '[': depth++; scalar = ""; break;
+      case '}': case ']': case ',':
+        if (depth == 1 && afterColon && key == "instrumental") instrumental = scalar == "true";
+        if (c != ',') depth--;
+        afterColon = false;
+        scalar = "";
+        break;
+      case ':': afterColon = true; scalar = ""; break;
+      case '"':
+        inString = true;
+        if (depth != 1) target = T_SKIP;
+        else if (!afterColon) target = T_KEY, key = "";
+        else if (key == "syncedLyrics") target = T_SYNCED, restart(), synced = true;
+        else if (key == "plainLyrics" && !synced) target = T_PLAIN, restart();
+        else target = T_SKIP;
+        break;
+      default:
+        if (!isspace(static_cast<unsigned char>(c)) && scalar.length() < 8) scalar += c;
+        break;
+    }
+  }
+};
+
+LyricsReader *lyrics = nullptr;  // while a pass runs
+esp_http_client_handle_t lrcClient = nullptr;  // kept between songs: one TLS handshake per pass
+
+uint32_t lrcRetryAfterS = 0;  // from a 429's Retry-After
+
+esp_err_t onLrcData(esp_http_client_event_t *e) {
+  if (e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && strcasecmp(e->header_key, "Retry-After") == 0) {
+    lrcRetryAfterS = strtoul(e->header_value, nullptr, 10);
+  }
+  if (e->event_id == HTTP_EVENT_ON_DATA && lyrics && esp_http_client_get_status_code(e->client) == 200) {
+    lyrics->feed(static_cast<const uint8_t *>(e->data), e->data_len);
+  }
+  return ESP_OK;
+}
+
+void lrcClose() {
+  if (lrcClient) esp_http_client_cleanup(lrcClient);
+  lrcClient = nullptr;
+}
+
+// The HTTP status (0: connection error).
+int lrcGet(const String &url) {
+  if (!lrcClient) {
+    esp_http_client_config_t cfg = {};
+    cfg.url = url.c_str();
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.user_agent = ART_USER_AGENT;
+    cfg.timeout_ms = HTTP_TIMEOUT_MS;
+    cfg.buffer_size = 1536;
+    cfg.buffer_size_tx = 1024;
+    cfg.event_handler = onLrcData;
+    lrcClient = esp_http_client_init(&cfg);
+    if (!lrcClient) return 0;
+  } else {
+    esp_http_client_set_url(lrcClient, url.c_str());
+  }
+  lyrics->reset();
+  lrcRetryAfterS = 0;
+  if (logTiming) Serial.printf("[art]   free %u, largest %u\n", freeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  const uint32_t t0 = millis();
+  const esp_err_t err = esp_http_client_perform(lrcClient);
+  const int status = err == ESP_OK ? esp_http_client_get_status_code(lrcClient) : 0;
+  if (logTiming) Serial.printf("[art]   lrclib %d in %lu ms\n", status, millis() - t0);
+  if (!status) lrcClose();  // a fresh connection next time
+  return status;
+}
+
+uint16_t today() {
+  const time_t now = time(nullptr);
+  return now > 1700000000 ? now / 86400 : 0;
+}
+
+// True if the song needs no lookup: known, or recently not found.
+bool lyricsHandled(uint32_t key) {
+  uint16_t day = 0;
+  const LyricKind kind = LyricStore::writerFind(key, &day);
+  if (kind == LYR_NOT_LOOKED) return false;
+  if (kind != LYR_NONE) return true;
+  const uint16_t now = today();
+  return !now || now - day < MISSING_RETRY_DAYS;  // no clock yet: can't tell its age
+}
+
+bool songNames(const SongRecord &rec, String &artist, String &title) {
+  title = String(rec.title, strnlen(rec.title, sizeof(rec.title)));
+  artist = String(rec.artist, strnlen(rec.artist, sizeof(rec.artist)));
+  if (placeholder(artist)) artist = String(rec.albumArtist, strnlen(rec.albumArtist, sizeof(rec.albumArtist)));
+  // Untagged songs show their file name as the title: nothing to look up.
+  return !placeholder(artist) && !placeholder(title) && !artist.equalsIgnoreCase("Various Artists");
+}
+
+uint32_t lastLrcRequest = 0;
+uint32_t lrcInterval = LRC_INTERVAL_MS;
+
+Outcome fetchLyrics(uint32_t key, const String &artist, const String &title, uint32_t durationMs) {
+  String url = "https://lrclib.net/api/get?artist_name=" + urlEncode(artist) + "&track_name=" + urlEncode(title);
+  if (durationMs >= 1000) url += "&duration=" + String((durationMs + 500) / 1000);
+  int status = 0;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t since = millis() - lastLrcRequest;
+    if (since < lrcInterval && !nap(lrcInterval - since)) return O_STOPPED;
+    lastLrcRequest = millis();
+    status = lrcGet(url);
+    if (stopRequested) return O_STOPPED;
+    if (status == 429) {  // too fast: slow down, then this song again
+      lrcInterval = min<uint32_t>(lrcInterval + 500, LRC_INTERVAL_MAX_MS);
+      if (!nap(lrcRetryAfterS ? min<uint32_t>(lrcRetryAfterS, 60) * 1000 : 2000)) return O_STOPPED;
+    } else if (status == 0) {
+      // LRCLIB drops a kept connection now and then; a new handshake right
+      // away often finds the heap still fragmented by the old one.
+      if (!nap(1500)) return O_STOPPED;
+    } else {
+      break;
+    }
+  }
+  if (status == 404) {
+    return LyricStore::put(key, LYR_NONE, 0, 0, today()) ? O_NONE : O_NET_ERROR;
+  }
+  if (status != 200) return O_NET_ERROR;
+  lyrics->finish();
+  if (lyrics->writeFailed) return O_NET_ERROR;
+  const LyricKind kind = lyrics->len ? (lyrics->synced ? LYR_SYNCED : LYR_PLAIN)
+                                     : lyrics->instrumental ? LYR_INSTRUMENTAL : LYR_NONE;
+  if (!LyricStore::put(key, kind, lyrics->base, lyrics->len, today())) return O_NET_ERROR;
+  Serial.printf("[art]   lyrics: %s, %u bytes\n",
+                kind == LYR_SYNCED ? "timed" : kind == LYR_PLAIN ? "plain" : kind == LYR_INSTRUMENTAL ? "instrumental" : "none",
+                lyrics->len);
+  if (kind == LYR_SYNCED || kind == LYR_PLAIN || kind == LYR_INSTRUMENTAL) {
+    lyricsSaved++;
+    return O_SAVED;
+  }
+  return O_NONE;
+}
+
+bool lyricsOn() {
+  return uiStyle.lyrics;
+}
+
+// Takes the next wanted song (false: none).
+bool takeWanted(uint32_t &id) {
+  bool got = false;
+  portENTER_CRITICAL(&wantLock);
+  if (wantCount && wantGen == passGen) {
+    id = wanted[--wantCount];
+    got = true;
+  } else {
+    wantCount = 0;
+  }
+  portEXIT_CRITICAL(&wantLock);
+  return got;
+}
+
 // ---------------------------------------------------------------- the pass
 enum PassResult { P_DONE, P_STOPPED, P_NO_WIFI, P_NET, P_BUSY };
 
@@ -976,26 +1259,117 @@ void makeBucket(uint32_t key) {
   f_mkdir(cardPath(bucket).c_str());
 }
 
-// Three steps over one cursor: album covers; stand-ins for artists (an album
-// cover, no WiFi); artist photos.
+// One song's lyrics: -1 if it needs no lookup, else the Outcome.
+int lyricsFor(LibReader &songs, uint32_t id, uint32_t shown, uint32_t total, PassResult &wifi) {
+  SongRecord rec;
+  String artist, title;
+  if (!songs.read(id, &rec) || !songNames(rec, artist, title)) return -1;
+  const uint32_t key = LyricStore::key(artist, title);
+  if (lyricsHandled(key)) return -1;
+  wifi = ensureWifi();
+  if (wifi != P_DONE) return O_STOPPED;
+  Serial.printf("[art] %lu/%lu lyrics of \"%s\" by \"%s\"\n", shown, total, title.c_str(), artist.c_str());
+  return fetchLyrics(key, artist, title, rec.durationMs);
+}
+
+// Four steps over one cursor: album covers; stand-ins for artists (an album
+// cover, no WiFi); artist photos; songs' lyrics. Songs the player asked
+// lyrics for go first.
 PassResult runPass() {
   if (!audioReleaseEngine()) return P_BUSY;  // music started meanwhile
-  LibReader albums, artists;
-  if (!albums.open(passGen, LF_ALBUMS, sizeof(AlbumRecord)) ||
-      !artists.open(passGen, LF_ARTISTS, sizeof(ArtistRecord))) {
-    return P_BUSY;
-  }
-  albums.setReadAhead(4096);
-  f_mkdir(cardPath(ART_DIR).c_str());
-  if (!ThumbStore::exists() && !ThumbStore::create(stopRequested)) return stopRequested ? P_STOPPED : P_BUSY;
-  if (migratedGen != passGen) {
-    if (!migrateKeys(albums, artists)) return P_STOPPED;
-    migratedGen = passGen;
-  }
-  const uint32_t nAlbums = albums.count(), nArtists = artists.count();
-  const uint32_t total = nAlbums + 2 * nArtists;
-  progressTotal = total;
+  // Lyrics steps and picture steps each have their files open only while
+  // they run: a TLS handshake (LRCLIB, archive.org) needs every KB.
+  const bool withLyrics = lyricsOn();
+  LibReader *songs = nullptr;
+  auto closeLyrics = [&]() {
+    lrcClose();
+    LyricStore::closeWriter();
+    delete lyrics;
+    lyrics = nullptr;
+    delete songs;
+    songs = nullptr;
+  };
+  auto openLyrics = [&]() {
+    if (songs) return true;
+    if (!LyricStore::exists() && !LyricStore::create(stopRequested)) return false;
+    songs = new (std::nothrow) LibReader();
+    lyrics = new (std::nothrow) LyricsReader();
+    if (songs && lyrics && songs->open(passGen, LF_SONGS, sizeof(SongRecord)) && LyricStore::openWriter()) return true;
+    closeLyrics();
+    return false;
+  };
   uint32_t netErrors = 0, saved = 0, none = 0;
+  // Counts an outcome; a PassResult to end the pass with, or P_DONE to go on.
+  auto tally = [&](int o) {
+    switch (o) {
+      case O_SAVED: saved++; netErrors = 0; break;
+      case O_NONE: none++; netErrors = 0; break;
+      case O_STOPPED: return P_STOPPED;
+      case O_SKIPPED: break;
+      case O_NET_ERROR:
+        if (++netErrors >= 3) return P_NET;
+        break;
+    }
+    return P_DONE;
+  };
+  auto wantedFirst = [&]() {
+    uint32_t id;
+    while (withLyrics && takeWanted(id)) {
+      if (stopRequested) return P_STOPPED;
+      if (!openLyrics()) return stopRequested ? P_STOPPED : P_BUSY;
+      PassResult wifi = P_DONE;
+      const int o = lyricsFor(*songs, id, 0, 0, wifi);
+      if (wifi != P_DONE) return wifi;
+      if (o >= 0) {
+        const PassResult r = tally(o);
+        if (r != P_DONE) return r;
+      }
+    }
+    return P_DONE;
+  };
+  const PassResult first = wantedFirst();
+  if (first != P_DONE) return first;
+  closeLyrics();
+
+  LibReader *albums = nullptr, *artists = nullptr;
+  auto closeArt = [&]() {
+    delete albums;
+    delete artists;
+    albums = artists = nullptr;
+    store.close();
+  };
+  auto openArt = [&]() {
+    albums = new (std::nothrow) LibReader();
+    artists = new (std::nothrow) LibReader();
+    if (!albums || !artists || !albums->open(passGen, LF_ALBUMS, sizeof(AlbumRecord)) ||
+        !artists->open(passGen, LF_ARTISTS, sizeof(ArtistRecord))) {
+      return P_BUSY;
+    }
+    albums->setReadAhead(4096);
+    f_mkdir(cardPath(ART_DIR).c_str());
+    if (!ThumbStore::exists() && !ThumbStore::create(stopRequested)) return stopRequested ? P_STOPPED : P_BUSY;
+    if (migratedGen != passGen) {
+      if (!migrateKeys(*albums, *artists)) return P_STOPPED;
+      migratedGen = passGen;
+    }
+    return P_DONE;
+  };
+  struct Closer {
+    std::function<void()> f;
+    ~Closer() { f(); }
+  } closer{[&]() { closeArt(); closeLyrics(); }};
+  // Lyrics first (every song), then the pictures: album covers, artist
+  // stand-ins, artist photos. Indexes into the files go by the catalog's
+  // counts (the same generation).
+  const uint32_t nSongs = withLyrics ? Catalog::songCount() : 0;
+  const uint32_t nAlbums = Catalog::albumCount(), nArtists = Catalog::artistCount();
+  if (cursorSongs != nSongs) {  // Lyrics turned on or off: the steps moved
+    cursorSongs = nSongs;
+    cursor = 0;
+  }
+  picturesFrom = nSongs;
+  const uint32_t total = nSongs + nAlbums + 2 * nArtists;
+  progressTotal = total;
   for (; cursor < total; cursor++) {
     progressDone = cursor;
     if (stopRequested) return P_STOPPED;
@@ -1005,55 +1379,75 @@ PassResult runPass() {
     AlbumRecord al;
     ArtistRecord ar;
     Outcome o;
-    if (cursor < nAlbums) {
-      if (!albums.read(cursor, &al) || !al.name[0] || (al.flags & (ALBUM_NONE | ALBUM_NONE_ALL))) continue;
+    if (cursor < nSongs) {
+      if (!openLyrics()) return stopRequested ? P_STOPPED : P_BUSY;
+      PassResult wifi = P_DONE;
+      const int lo = lyricsFor(*songs, cursor, cursor + 1, total, wifi);
+      if (wifi != P_DONE) return wifi;
+      if (lo < 0) continue;
+      o = static_cast<Outcome>(lo);
+      const PassResult r = tally(o);
+      if (r != P_DONE) return r;
+      continue;
+    }
+    if (!albums) {
+      if (songs) {
+        Serial.printf("[art] lyrics done: %lu saved, %lu without; pictures next\n", saved, none);
+        saved = none = 0;
+      }
+      closeLyrics();
+      const PassResult r = openArt();
+      if (r != P_DONE) return r;
+    }
+    const uint32_t c = cursor - nSongs;  // the pictures' own cursor
+    if (c < nAlbums) {
+      if (!albums->read(c, &al) || !al.name[0] || (al.flags & (ALBUM_NONE | ALBUM_NONE_ALL))) continue;
       const String album(al.name, strnlen(al.name, sizeof(al.name)));
       if (placeholder(album)) continue;  // songs without an album tag
       String artist;
-      if (artists.read(al.artistId, &ar)) artist = String(ar.name, strnlen(ar.name, sizeof(ar.name)));
+      if (artists->read(al.artistId, &ar)) artist = String(ar.name, strnlen(ar.name, sizeof(ar.name)));
       // Without an artist, a search by album name alone matches too many
       // albums to trust ("Greatest Hits"): skip.
       if (placeholder(artist)) continue;
       const uint32_t key = albumKey(artist.c_str(), album.c_str());
       if (makeMissingThumb(key)) continue;
       if (alreadyHandled(key)) continue;
+      albums->setReadAhead(0);  // 4 KB the TLS handshake needs (archive.org covers)
       const PassResult w = ensureWifi();
       if (w != P_DONE) return w;
       makeBucket(key);
       Serial.printf("[art] %lu/%lu \"%s\" by \"%s\"\n", cursor + 1, total, album.c_str(), artist.c_str());
       o = fetchAlbum(key, album, artist);
-    } else if (cursor < nAlbums + nArtists) {
-      if (cursor == nAlbums) standIns = StandInStats();
-      if (artists.read(cursor - nAlbums, &ar)) makeArtistStandIn(ar, albums);
-      if (cursor + 1 == nAlbums + nArtists) {
+    } else if (c < nAlbums + nArtists) {
+      if (c == nAlbums) standIns = StandInStats();
+      if (artists->read(c - nAlbums, &ar)) makeArtistStandIn(ar, *albums);
+      if (c + 1 == nAlbums + nArtists) {
         Serial.printf("[art] artist stand-ins: %lu made, %lu had a picture, %lu without an album cover\n",
                       standIns.made, standIns.had, standIns.noCover);
       }
       continue;
     } else {
-      if (!artists.read(cursor - nAlbums - nArtists, &ar)) continue;
+      if (!artists->read(c - nAlbums - nArtists, &ar)) continue;
       const String artist(ar.name, strnlen(ar.name, sizeof(ar.name)));
       if (placeholder(artist) || artist.equalsIgnoreCase("Various Artists")) continue;
       const uint32_t key = artistKey(artist.c_str());
       if (makeMissingThumb(key)) continue;
       if (alreadyHandled(key)) continue;
+      albums->setReadAhead(0);  // 4 KB the TLS handshake needs (archive.org covers)
       const PassResult w = ensureWifi();
       if (w != P_DONE) return w;
       makeBucket(key);
       Serial.printf("[art] %lu/%lu photo of \"%s\"\n", cursor + 1, total, artist.c_str());
       o = fetchArtist(key, artist);
     }
-    switch (o) {
-      case O_SAVED: saved++; netErrors = 0; break;
-      case O_NONE: none++; netErrors = 0; break;
-      case O_STOPPED: return P_STOPPED;
-      case O_NET_ERROR:
-        if (++netErrors >= 3) return P_NET;
-        break;
-    }
+    const PassResult r = tally(o);
+    if (r != P_DONE) return r;
   }
+  closeArt();
+  const PassResult last = wantedFirst();
+  if (last != P_DONE) return last;
   progressDone = total;
-  Serial.printf("[art] pass done: %lu pictures saved, %lu without one\n", saved, none);
+  Serial.printf("[art] pass done: %lu saved, %lu without one\n", saved, none);
   return P_DONE;
 }
 
@@ -1083,7 +1477,8 @@ bool startPass() {
   }
   stopRequested = false;
   progressDone = cursor;
-  progressTotal = Catalog::albumCount() + 2 * Catalog::artistCount();
+  progressTotal = Catalog::albumCount() + 2 * Catalog::artistCount() + (lyricsOn() ? Catalog::songCount() : 0);
+  picturesFrom = lyricsOn() ? Catalog::songCount() : 0;
   return xTaskCreatePinnedToCore(fetchTask, "artfetch", TASK_STACK, nullptr, 1, &task, 0) == pdPASS;
 }
 
@@ -1128,7 +1523,7 @@ void artFetchTick() {
   }
   if (!idleSince) idleSince = millis() | 1;
   if (task || !enabled || millis() - idleSince < IDLE_BEFORE_MS) return;
-  if (finishedGen == Catalog::generation()) return;
+  if (finishedGen == Catalog::generation() && !(wantCount && lyricsOn())) return;
   if (retryAt && static_cast<int32_t>(millis() - retryAt) < 0) return;
   retryAt = 0;
   startPass();
@@ -1147,7 +1542,8 @@ void artFetchNow() {
 void artFetchArtistsNow() {
   artFetchStop();
   cursorGen = Catalog::generation();
-  cursor = Catalog::albumCount();
+  cursor = (lyricsOn() ? Catalog::songCount() : 0) + Catalog::albumCount();
+  cursorSongs = lyricsOn() ? Catalog::songCount() : 0;
   albumsSkipped = true;
   artFetchNow();
 }
@@ -1166,6 +1562,24 @@ bool artFetchRunning() {
 
 String artFetchStatus() {
   if (!task) return "";
-  const uint32_t total = progressTotal;
-  return "Art\n" + String(total ? progressDone * 100 / total : 0) + "%";
+  const uint32_t total = progressTotal, done = progressDone, from = picturesFrom;
+  if (done < from) return "Lyrics\n" + String(done * 100 / from) + "%";
+  return "Art\n" + String(total > from ? (done - from) * 100 / (total - from) : 0) + "%";
+}
+
+void artLyricsWant(uint32_t songId) {
+  if (!Catalog::isOpen()) return;
+  portENTER_CRITICAL(&wantLock);
+  if (wantGen != Catalog::generation()) wantCount = 0, wantGen = Catalog::generation();
+  bool there = false;
+  for (int i = 0; i < wantCount; i++) there |= wanted[i] == songId;
+  if (!there) {
+    if (wantCount == WANT_MAX) memmove(wanted, wanted + 1, --wantCount * sizeof(wanted[0]));
+    wanted[wantCount++] = songId;  // the newest is taken first
+  }
+  portEXIT_CRITICAL(&wantLock);
+}
+
+uint32_t artLyricsSaved() {
+  return lyricsSaved;
 }
