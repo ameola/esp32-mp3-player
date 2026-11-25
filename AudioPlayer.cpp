@@ -34,8 +34,60 @@ static bool IRAM_ATTR onSendQueueOverflow(i2s_chan_handle_t, i2s_event_data_t *,
   return false;
 }
 
+// Tone control: a low shelf (bass) and a high shelf (treble), RBJ cookbook
+// biquads with slope 1, run on the mono mix (one speaker). With a boost the
+// input is first turned down by half of it, so a boosted loud song clips
+// less; the rest is clamped.
+#define BASS_HZ 180.0f
+#define TREBLE_HZ 4000.0f
+
+struct Biquad {
+  float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+  float x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+
+  void shelf(bool high, float hz, float rate, float db) {
+    const float A = powf(10.0f, db / 40.0f), w = 2.0f * PI * hz / rate;
+    const float c = cosf(w), alpha = sinf(w) / 2.0f * sqrtf(2.0f), k = 2.0f * sqrtf(A) * alpha;
+    float n0, n1, n2, d0, d1, d2;
+    if (!high) {
+      n0 = A * ((A + 1) - (A - 1) * c + k);
+      n1 = 2 * A * ((A - 1) - (A + 1) * c);
+      n2 = A * ((A + 1) - (A - 1) * c - k);
+      d0 = (A + 1) + (A - 1) * c + k;
+      d1 = -2 * ((A - 1) + (A + 1) * c);
+      d2 = (A + 1) + (A - 1) * c - k;
+    } else {
+      n0 = A * ((A + 1) + (A - 1) * c + k);
+      n1 = -2 * A * ((A - 1) + (A + 1) * c);
+      n2 = A * ((A + 1) + (A - 1) * c - k);
+      d0 = (A + 1) - (A - 1) * c + k;
+      d1 = 2 * ((A - 1) - (A + 1) * c);
+      d2 = (A + 1) - (A - 1) * c - k;
+    }
+    b0 = n0 / d0, b1 = n1 / d0, b2 = n2 / d0, a1 = d1 / d0, a2 = d2 / d0;
+  }
+  float run(float x) {
+    const float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1, x1 = x, y2 = y1, y1 = y;
+    return y;
+  }
+  void clear() { x1 = x2 = y1 = y2 = 0; }
+};
+
 class ContinuousI2S : public AudioOutputI2S {
 public:
+  // Bass and treble in dB (0, 0: off).
+  void setTone(int8_t bass, int8_t treble) {
+    bassDb = bass;
+    trebleDb = treble;
+    retune();
+  }
+  bool SetRate(int hz) override {
+    const bool ok = AudioOutputI2S::SetRate(hz);
+    retune();
+    return ok;
+  }
+
   bool begin() override {
     if (!started) {
       started = AudioOutputI2S::begin();
@@ -97,8 +149,12 @@ public:
     int16_t ms[2] = {sample[0], sample[1]};
     MakeSampleStereo16(ms);
     if (mono) {
-      const int32_t sum = ms[LEFTCHANNEL] + ms[RIGHTCHANNEL];
-      ms[LEFTCHANNEL] = ms[RIGHTCHANNEL] = (sum >> 1) & 0xffff;
+      int32_t v = (ms[LEFTCHANNEL] + ms[RIGHTCHANNEL]) >> 1;
+      if (toneOn) {
+        const float y = treble.run(bass.run(v * preamp));
+        v = y > 32767.0f ? 32767 : y < -32768.0f ? -32768 : static_cast<int32_t>(y);
+      }
+      ms[LEFTCHANNEL] = ms[RIGHTCHANNEL] = v & 0xffff;
     }
     stage[pending++] = (static_cast<uint32_t>(Amplify(ms[RIGHTCHANNEL])) << 16) |
                        (Amplify(ms[LEFTCHANNEL]) & 0xffff);
@@ -117,6 +173,20 @@ public:
 
 private:
   static constexpr size_t STAGE_SAMPLES = 128;  // 2.9 ms at 44.1 kHz
+  int8_t bassDb = 0, trebleDb = 0;
+  bool toneOn = false;
+  float preamp = 1.0f;
+  Biquad bass, treble;
+
+  void retune() {
+    toneOn = bassDb || trebleDb;
+    const float rate = hertz > 0 ? hertz : 44100;
+    bass.shelf(false, BASS_HZ, rate, bassDb);
+    treble.shelf(true, min(TREBLE_HZ, rate * 0.45f), rate, trebleDb);
+    bass.clear();
+    treble.clear();
+    preamp = powf(10.0f, -max<int>(0, max(bassDb, trebleDb)) / 40.0f);
+  }
 
   // Moves as many staged samples into the DMA ring as fit, without waiting.
   void drain() {
@@ -353,6 +423,7 @@ static Mp3Decoder *mp3 = nullptr;  // Helix decoder: about a third of libmad's C
 static ContinuousI2S *audioOut = nullptr;
 static volatile bool trackEnded = false;
 static int volume = DEFAULT_VOLUME;
+static uint8_t volumeLimit = 100;  // percent of full gain at the top step
 
 uint32_t audioDecodeUs = 0;  // time spent decoding (Serial "audiocpu")
 
@@ -554,7 +625,17 @@ uint32_t audioFileSize() {
 void audioSetVolume(int level) {
   AudioLock held;
   volume = constrain(level, 0, VOLUME_STEPS);
-  audioOut->SetGain(volume * GAIN_PER_STEP);
+  audioOut->SetGain(volume * GAIN_PER_STEP * volumeLimit / 100.0f);
+}
+
+void audioSetTone(int8_t bassDb, int8_t trebleDb) {
+  AudioLock held;
+  audioOut->setTone(bassDb, trebleDb);
+}
+
+void audioSetVolumeLimit(uint8_t percent) {
+  volumeLimit = constrain(percent, 10, 100);
+  audioSetVolume(volume);
 }
 
 int audioVolume() {

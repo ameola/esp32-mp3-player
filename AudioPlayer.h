@@ -25,6 +25,10 @@ uint32_t audioFileSize();
 
 void audioSetVolume(int level);  // 0..VOLUME_STEPS
 int audioVolume();
+// Tone (Settings > Audio): bass and treble shelves in dB, 0 for flat.
+void audioSetTone(int8_t bassDb, int8_t trebleDb);
+// The loudest the volume control goes, in percent of full (Settings > Audio).
+void audioSetVolumeLimit(uint8_t percent);
 
 // Times the output ran dry during playback (audible gaps), since boot.
 uint32_t audioUnderruns();

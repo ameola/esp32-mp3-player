@@ -235,15 +235,50 @@ static bool isPlaying(uint32_t songId) {
 // action runs on a tap, and an information row shows a value.
 enum SettingId : uint8_t {
   S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP, S_LYRICS,  // Display
+  S_BASS, S_TREBLE, S_VOLUME_MAX,                                 // Audio
   S_WIFI, S_ART, S_ART_NOW,                                       // WiFi & downloads
   S_SONGS, S_ARTISTS, S_ALBUMS, S_REBUILD,                        // Library
   S_VERSION, S_BOARD, S_MEMORY, S_CARD, S_UPTIME,                 // System
   SETTING_COUNT
 };
-enum SettingGroup : uint8_t { G_DISPLAY, G_WIFI, G_LIBRARY, G_SYSTEM, GROUP_COUNT };
-static const uint8_t kGroupFirst[GROUP_COUNT + 1] = {S_THEME, S_WIFI, S_SONGS, S_VERSION, SETTING_COUNT};
-static const char *const kGroupNames[GROUP_COUNT] = {"Display", "WiFi & downloads", "Library", "System"};
-static const uint16_t kGroupIcons[GROUP_COUNT] = {ICON_PALETTE, ICON_WIFI, ICON_MUSIC_NOTE, ICON_MEMORY};
+enum SettingGroup : uint8_t { G_DISPLAY, G_AUDIO, G_WIFI, G_LIBRARY, G_SYSTEM, GROUP_COUNT };
+static const uint8_t kGroupFirst[GROUP_COUNT + 1] = {S_THEME, S_BASS, S_WIFI, S_SONGS, S_VERSION, SETTING_COUNT};
+static const char *const kGroupNames[GROUP_COUNT] = {"Display", "Audio", "WiFi & downloads", "Library", "System"};
+static const uint16_t kGroupIcons[GROUP_COUNT] = {ICON_PALETTE, ICON_EQUALIZER, ICON_WIFI, ICON_MUSIC_NOTE, ICON_MEMORY};
+
+// Audio settings (NVS "audio"): bass and treble as choice indexes (3 is
+// flat, 2 dB a step), and the volume limit.
+#define TONE_STEPS 7
+static uint8_t bassIndex = 3, trebleIndex = 3, volumeMaxIndex = 0;
+static const uint8_t kVolumeMax[] = {100, 75, 50};
+static int8_t toneDb(uint8_t index) { return (static_cast<int>(index) - 3) * 2; }
+static String toneName(uint8_t index) {
+  const int8_t db = toneDb(index);
+  return db == 0 ? String("Flat") : (db > 0 ? "+" : "") + String(db) + " dB";
+}
+static void applyAudioSettings() {
+  audioSetTone(toneDb(bassIndex), toneDb(trebleIndex));
+  audioSetVolumeLimit(kVolumeMax[volumeMaxIndex]);
+}
+static void loadAudioSettings() {
+  Preferences p;
+  if (p.begin("audio", true)) {
+    bassIndex = min<uint8_t>(p.getUChar("bass", 3), TONE_STEPS - 1);
+    trebleIndex = min<uint8_t>(p.getUChar("treble", 3), TONE_STEPS - 1);
+    volumeMaxIndex = min<uint8_t>(p.getUChar("volMax", 0), 2);
+    p.end();
+  }
+  applyAudioSettings();
+}
+static void saveAudioSettings() {
+  Preferences p;
+  if (p.begin("audio", false)) {
+    p.putUChar("bass", bassIndex);
+    p.putUChar("treble", trebleIndex);
+    p.putUChar("volMax", volumeMaxIndex);
+    p.end();
+  }
+}
 
 static uint32_t rebuildArmedAt = 0;  // first tap on "Rebuild library"; a second within 4 s starts it
 static bool rebuildRequested = false;
@@ -262,6 +297,8 @@ static uint8_t choiceCount(uint32_t id) {
     case S_DENSITY: case S_TEXT: case S_CORNERS: case S_ART: case S_LYRICS: return 2;
     case S_BRIGHTNESS: return 4;
     case S_SLEEP: return 5;
+    case S_BASS: case S_TREBLE: return TONE_STEPS;
+    case S_VOLUME_MAX: return 3;
     default: return 0;
   }
 }
@@ -276,6 +313,8 @@ static String choiceName(uint32_t id, uint8_t i) {
     case S_SLEEP: return i == 4 ? String("Never") : String(uiSleepName(i)) + " without a touch";
     case S_ART: return i ? "On, while nothing plays" : "Off";
     case S_LYRICS: return i ? "Swipe the cover to show" : "Off";
+    case S_BASS: case S_TREBLE: return toneName(i);
+    case S_VOLUME_MAX: return i ? String(kVolumeMax[i]) + "% of full" : String("Full");
     default: return "";
   }
 }
@@ -290,6 +329,9 @@ static uint8_t choiceCurrent(uint32_t id) {
     case S_SLEEP: return uiStyle.sleep;
     case S_LYRICS: return uiStyle.lyrics;
     case S_ART: return artFetchEnabled();
+    case S_BASS: return bassIndex;
+    case S_TREBLE: return trebleIndex;
+    case S_VOLUME_MAX: return volumeMaxIndex;
     default: return 0;
   }
 }
@@ -297,6 +339,7 @@ static uint8_t choiceCurrent(uint32_t id) {
 static const char *settingLabel(uint32_t id) {
   static const char *const labels[SETTING_COUNT] = {
     "Theme", "Density", "Text size", "Corners", "Brightness", "Screen off after", "Lyrics",
+    "Bass", "Treble", "Maximum volume",
     "WiFi network", "Art & lyrics downloads", "Download now",
     "Songs", "Artists", "Albums", "Rebuild library",
     "Version", "Board", "Free memory", "SD card", "Running for"};
@@ -306,6 +349,7 @@ static const char *settingLabel(uint32_t id) {
 static uint16_t settingIcon(uint32_t id) {
   static const uint16_t icons[SETTING_COUNT] = {
     ICON_PALETTE, ICON_DENSITY, ICON_TEXT_SIZE, ICON_CORNER, ICON_BRIGHTNESS, ICON_BEDTIME, ICON_LYRICS,
+    ICON_EQUALIZER, ICON_TUNE, ICON_VOLUME,
     ICON_WIFI, ICON_IMAGE, ICON_DOWNLOAD,
     ICON_MUSIC_NOTE, ICON_PERSON, ICON_ALBUM, ICON_REFRESH,
     ICON_INFO, ICON_MEMORY, ICON_MEMORY, ICON_FOLDER, ICON_INFO};
@@ -340,6 +384,8 @@ static bool isInfoSetting(uint32_t id) {
 static String groupSummary(uint8_t g) {
   switch (g) {
     case G_DISPLAY: return String(uiThemeName(uiStyle.theme)) + " \xC2\xB7 " + uiBrightnessName(uiStyle.brightness);
+    case G_AUDIO:
+      return bassIndex == 3 && trebleIndex == 3 ? String("Flat") : "Bass " + toneName(bassIndex) + " \xC2\xB7 treble " + toneName(trebleIndex);
     case G_WIFI: return (wifiSsid.length() ? wifiSsid : String("Not set up")) + " \xC2\xB7 art " + (artFetchEnabled() ? "on" : "off");
     case G_LIBRARY: return formatCount(Catalog::titleCount()) + " songs";
     case G_SYSTEM: return "Version " FIRMWARE_VERSION;
@@ -1784,6 +1830,7 @@ void uiShowPlayer() {
   if (!initialized) {
     resetTabs();
     loadPlayModes();
+    loadAudioSettings();
     initialized = true;
   }
   if (!scrollAreaSet) {
@@ -2574,6 +2621,13 @@ static void pickChoice(uint32_t id, uint8_t i) {
     case S_BRIGHTNESS: style.brightness = i; break;
     case S_SLEEP: style.sleep = i; break;
     case S_LYRICS: style.lyrics = i; break;
+    case S_BASS: case S_TREBLE: case S_VOLUME_MAX:
+      (id == S_BASS ? bassIndex : id == S_TREBLE ? trebleIndex : volumeMaxIndex) = i;
+      applyAudioSettings();
+      saveAudioSettings();
+      logSetting(id);
+      drawRows();
+      return;
     case S_ART: {
       CardSettings cs;
       cardSettingsLoad(cs);
