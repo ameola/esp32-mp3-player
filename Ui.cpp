@@ -676,12 +676,11 @@ static int lastProgressPx = -1;
 static int32_t lastTimeShown = -1;  // elapsed seconds currently on screen
 static uint8_t wifiShown = 0xFF;    // WiFi state in the header (see wifiState())
 
-static void drawCenteredText(const String &text, int16_t cx, int16_t y, uint8_t size,
-                             uint16_t color) {
-  canvas->setTextSize(size);
-  canvas->setTextColor(color);
-  canvas->setCursor(cx - static_cast<int16_t>(text.length() * 6 * size) / 2, y);
-  canvas->print(text);
+// Centred text with its top near y: size 2 is a title, size 1 small text.
+static void drawCenteredText(const String &text, int16_t cx, int16_t y, uint8_t size, uint16_t color) {
+  const UiFont &f = size >= 2 ? FONT_TITLE : FONT_SMALL;
+  const String fitted = uiFitText(f, text, SCREEN_W - 16);
+  uiDrawText(f, fitted.c_str(), cx - uiTextWidth(f, fitted.c_str()) / 2, y + (size >= 2 ? 13 : 9), color);
 }
 
 static void drawCentered(const UiFont &f, const String &text, int16_t cx, int16_t baseline, uint16_t color) {
@@ -1618,10 +1617,7 @@ static void drawPlainScreen() {
   resetListScroll();
   lcdFillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H, C_BG);
   canvas->fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
-  canvas->setTextSize(2);
-  canvas->setTextColor(C_TEXT);
-  canvas->setCursor(8, 15);
-  canvas->print("MP3 Player");
+  uiDrawText(FONT_TITLE, "MP3 Player", 10, 22, pal.text);
   lcdBlit(0, 0, SCREEN_W, HEADER_H);
 }
 
@@ -1659,8 +1655,9 @@ void uiShowProgress(bool redraw, const char *title, const char *phase, float fra
   fraction = constrain(fraction, 0.0f, 1.0f);
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
   drawCenteredText(phase, SCREEN_W / 2, 0, 1, C_TEXT);
-  canvas->drawRect(BAR_X, 13, BAR_W, 12, C_DIM);
-  canvas->fillRect(BAR_X + 2, 15, static_cast<int16_t>((BAR_W - 4) * fraction), 8, C_ACCENT);
+  canvas->fillRect(BAR_X, 15, BAR_W, 6, pal.line);
+  canvas->fillRect(BAR_X, 15, static_cast<int16_t>(BAR_W * fraction), 6, pal.accent);
+  roundRect(BAR_X, 15, BAR_W, 6, uiStyle.square ? 0 : 3, pal.bg);
   drawCenteredText(counts + (counts.isEmpty() ? "" : "   ") + String(static_cast<int>(fraction * 100)) + "%",
                    SCREEN_W / 2, 32, 1, C_DIM);
   lcdBlit(0, PROGRESS_SCREEN_Y, SCREEN_W, CANVAS_H);
@@ -1668,21 +1665,15 @@ void uiShowProgress(bool redraw, const char *title, const char *phase, float fra
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
   if (folder && folder[0]) {
     const String converted = decodeUtf8(reinterpret_cast<const uint8_t *>(folder), strlen(folder));
-    const size_t perLine = (SCREEN_W - 16) / 6;
-    String text = converted.length() > perLine * 2
-                    ? "..." + converted.substring(converted.length() - (perLine * 2 - 3))
-                    : converted;
-    canvas->setTextSize(1);
-    canvas->setTextColor(C_DIM);
-    canvas->setCursor(8, 0);
-    canvas->print("Folder:");
-    canvas->setTextColor(C_TEXT);
-    canvas->setCursor(8, 12);
-    canvas->print(text.substring(0, perLine));
-    if (text.length() > perLine) {
-      canvas->setCursor(8, 24);
-      canvas->print(text.substring(perLine));
-    }
+    // Two lines of the path, its end kept: the first line takes what fits.
+    const int16_t room = SCREEN_W - 20;
+    String rest = converted;
+    while (uiTextWidth(FONT_SMALL, rest.c_str()) > 2 * room && rest.length() > 1) rest.remove(0, 1);
+    size_t cut = rest.length();
+    while (cut > 0 && uiTextWidth(FONT_SMALL, rest.substring(0, cut).c_str()) > room) cut--;
+    uiDrawText(FONT_LABEL, "FOLDER", 10, 10, pal.dim);
+    uiDrawText(FONT_SMALL, rest.substring(0, cut).c_str(), 10, 25, pal.text);
+    uiDrawText(FONT_SMALL, rest.substring(cut).c_str(), 10, 39, pal.text);
   }
   lcdBlit(0, FOLDER_Y, SCREEN_W, CANVAS_H);
 }

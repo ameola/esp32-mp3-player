@@ -6,6 +6,7 @@
 
 #include "Config.h"
 #include "Lcd.h"
+#include "UiFont.h"
 #include "Text.h"
 
 namespace {
@@ -55,15 +56,17 @@ Screen afterMessage = S_LIST;
 WifiSetupResult resultAfterMessage = WS_RUNNING;
 
 // ---------------------------------------------------------------- drawing helpers
+// y is the top of the text: size 2 is body text, size 1 small text.
+const UiFont &fontFor(uint8_t size) {
+  return size >= 2 ? FONT_BODY : FONT_SMALL;
+}
+
 void text(const String &s, int16_t x, int16_t y, uint8_t size, uint16_t color) {
-  canvas->setTextSize(size);
-  canvas->setTextColor(color);
-  canvas->setCursor(x, y);
-  canvas->print(s);
+  uiDrawText(fontFor(size), s.c_str(), x, y + (size >= 2 ? 12 : 9), color);
 }
 
 void centered(const String &s, int16_t cx, int16_t y, uint8_t size, uint16_t color) {
-  text(s, cx - static_cast<int16_t>(s.length() * 6 * size) / 2, y, size, color);
+  text(s, cx - uiTextWidth(fontFor(size), s.c_str()) / 2, y, size, color);
 }
 
 String display(const String &s) {  // SSIDs are UTF-8; the font is ASCII
@@ -71,13 +74,14 @@ String display(const String &s) {  // SSIDs are UTF-8; the font is ASCII
 }
 
 void button(int16_t x, int16_t w, int16_t h, const char *label, bool pressed, bool enabled = true) {
-  canvas->fillRoundRect(x + 3, 3, w - 6, h - 6, 6, pressed ? C_BUTTON_PRESS : C_BUTTON);
-  centered(label, x + w / 2, h / 2 - 4, 1, enabled ? C_TEXT : C_DIM);
+  canvas->fillRoundRect(x + 4, 6, w - 8, h - 12, uiStyle.square ? 2 : (h - 12) / 2, pressed ? C_BUTTON_PRESS : C_BUTTON);
+  const int16_t tw = uiTextWidth(FONT_LABEL, label);
+  uiDrawText(FONT_LABEL, label, x + (w - tw) / 2, h / 2 + 4, enabled ? C_TEXT : C_DIM);
 }
 
 void drawHeader(const char *title) {
-  canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_HEADER);
-  text(title, 8, 15, 2, C_TEXT);
+  canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
+  uiDrawText(FONT_TITLE, title, 10, 29, C_TEXT);
   lcdBlit(0, 0, SCREEN_W, WS_HEADER_H);
 }
 
@@ -129,8 +133,8 @@ void drawNetRow(int r) {
   if (i < nets.size()) {
     const Net &n = nets[i];
     const bool saved = n.ssid == savedSsid();
-    text(fitText(display(n.ssid), 15), 8, 8, 2, C_TEXT);
-    if (saved) text("saved", 190, 2, 1, C_ACCENT);
+    text(uiFitText(FONT_BODY, display(n.ssid), saved ? 132 : 172), 10, 8, 2, C_TEXT);
+    if (saved) uiDrawText(FONT_LABEL, "SAVED", 146, 20, C_ACCENT);
     // Signal: 4 bars; lock: a small padlock.
     const int bars = n.rssi > -55 ? 4 : n.rssi > -67 ? 3 : n.rssi > -75 ? 2 : 1;
     for (int b = 0; b < 4; b++) {
@@ -246,9 +250,10 @@ void drawKeyRow(int row) {
     canvas->fillRoundRect(k.x + 2, 3, k.w - 4, WS_KEY_H - 6, 4,
                           pressed ? C_BUTTON_PRESS : active ? C_TAB_ACTIVE : C_BUTTON);
     if (k.label) {
-      centered(k.label, k.x + k.w / 2, WS_KEY_H / 2 - 4, 1, k.code == K_JOIN ? C_ACCENT : C_TEXT);
+      const int16_t tw = uiTextWidth(FONT_LABEL, k.label);
+      uiDrawText(FONT_LABEL, k.label, k.x + (k.w - tw) / 2, WS_KEY_H / 2 + 4, k.code == K_JOIN ? C_ACCENT : C_TEXT);
     } else {
-      centered(String(static_cast<char>(k.code)), k.x + k.w / 2, WS_KEY_H / 2 - 8, 2, C_TEXT);
+      centered(String(static_cast<char>(k.code)), k.x + k.w / 2, WS_KEY_H / 2 - 9, 2, C_TEXT);
     }
   }
   lcdBlit(0, WS_KEYS_Y + row * WS_KEY_H, SCREEN_W, WS_KEY_H);
@@ -257,9 +262,9 @@ void drawKeyRow(int row) {
 void drawField() {
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
   canvas->drawRoundRect(6, 4, SCREEN_W - 12, 36, 4, C_DIM);
-  const size_t visible = 17;
-  String shown = password.length() > visible ? password.substring(password.length() - visible) : password;
-  text(shown + "_", 14, 14, 2, C_TEXT);
+  String shown = password + "_";
+  while (shown.length() > 1 && uiTextWidth(FONT_BODY, shown.c_str()) > SCREEN_W - 32) shown.remove(0, 1);
+  text(shown, 14, 12, 2, C_TEXT);
   lcdBlit(0, WS_FIELD_Y, SCREEN_W, CANVAS_H);
 }
 
