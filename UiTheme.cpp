@@ -80,6 +80,10 @@ void uiStyleSet(const UiStyle &style) {
   }
 }
 
+const UiPalette &uiThemePalette(uint8_t theme) {
+  return theme == THEME_COVER ? coverPal : kThemes[min<uint8_t>(theme, THEME_COUNT - 1)];
+}
+
 const char *uiThemeName(uint8_t theme) {
   return kThemeNames[min<uint8_t>(theme, THEME_COUNT - 1)];
 }

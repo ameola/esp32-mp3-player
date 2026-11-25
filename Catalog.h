@@ -42,7 +42,8 @@ bool noneSong(uint32_t pos, uint32_t &id);    // none.idx: every "none" album's 
 
 uint32_t artistCount();
 bool artist(uint32_t id, ArtistRecord &out);
-uint32_t albumCount();
+uint32_t albumCount();       // every album record, artists' "none" albums included
+uint32_t albumIndexCount();  // albums in the Albums tab (album.idx)
 bool album(uint32_t id, AlbumRecord &out);
 bool albumByName(uint32_t pos, uint32_t &id);  // album.idx: albums by name
 

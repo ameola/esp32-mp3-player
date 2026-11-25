@@ -15,6 +15,8 @@
 #include "UiTheme.h"
 #include "WifiSetup.h"
 #include <Preferences.h>
+#include <SD.h>
+#include <esp_heap_caps.h>
 #include "ThumbStore.h"
 
 // ================================================================ Navigation model
@@ -28,12 +30,16 @@ enum ListKind : uint8_t {
   L_ALBUMS,         // all albums by name
   L_ALBUM_SONGS,    // param: album id. Track order
   L_FOLDER,         // param: folder id. Subfolders, then songs
-  L_SETTINGS,       // the Settings tab
+  L_SETTINGS,       // the Settings tab: its groups
+  L_SETTINGS_GROUP, // param: SettingGroup. Its settings
+  L_SETTING_CHOICE, // param: SettingId. Its choices
 };
 
 enum RowKind : uint8_t { R_NONE, R_SONG, R_ARTIST, R_ALBUM, R_ALL_SONGS, R_FOLDER, R_SETTING,
                          R_HERO,      // page header (id: 0 top half, 1 bottom half)
-                         R_ACTIONS }; // Play all / Shuffle
+                         R_ACTIONS,   // Play all / Shuffle
+                         R_GROUP,     // Settings group (id: SettingGroup)
+                         R_CHOICE };  // one choice of a setting (id: its index)
 
 struct Level {
   ListKind kind = L_SONGS;
@@ -49,6 +55,8 @@ struct Row {
   uint32_t art = 0;   // artist, album and song rows: thumbnail key (artArtistKey, artAlbumKey); 0 none
   uint32_t art2 = 0;  // song rows: cover to try if `art` has none (compilations)
   uint16_t icon = 0;  // placeholder / settings icon (0: by kind)
+  bool chevron = false;  // settings rows that open something
+  bool checked = false;  // the current choice
 };
 
 #define MAX_NAV_DEPTH 12
@@ -196,9 +204,22 @@ static bool isPlaying(uint32_t songId) {
   return playIndex >= 0 && current.id == songId;
 }
 
-// ---------------------------------------------------------------- Settings tab
-// One row per setting; a tap changes it (themes and layouts apply at once).
-enum SettingId : uint8_t { S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP, S_ART, S_WIFI, S_REBUILD, S_SYSTEM, SETTING_COUNT };
+// ---------------------------------------------------------------- Settings
+// A small tree on the list machinery: groups, each a list of settings; a
+// setting with choices opens a list of them (the current one ticked), an
+// action runs on a tap, and an information row shows a value.
+enum SettingId : uint8_t {
+  S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP,  // Display
+  S_WIFI, S_ART, S_ART_NOW,                                       // WiFi & album art
+  S_SONGS, S_ARTISTS, S_ALBUMS, S_REBUILD,                        // Library
+  S_VERSION, S_BOARD, S_MEMORY, S_CARD, S_UPTIME,                 // System
+  SETTING_COUNT
+};
+enum SettingGroup : uint8_t { G_DISPLAY, G_WIFI, G_LIBRARY, G_SYSTEM, GROUP_COUNT };
+static const uint8_t kGroupFirst[GROUP_COUNT + 1] = {S_THEME, S_WIFI, S_SONGS, S_VERSION, SETTING_COUNT};
+static const char *const kGroupNames[GROUP_COUNT] = {"Display", "WiFi & album art", "Library", "System"};
+static const uint16_t kGroupIcons[GROUP_COUNT] = {ICON_PALETTE, ICON_WIFI, ICON_MUSIC_NOTE, ICON_MEMORY};
+
 static uint32_t rebuildArmedAt = 0;  // first tap on "Rebuild library"; a second within 4 s starts it
 static bool rebuildRequested = false;
 static bool wifiSetupRequested = false;
@@ -210,51 +231,132 @@ static String formatCount(uint32_t n) {
   return s;
 }
 
-static bool settingRow(uint32_t i, Row &row) {
-  row.kind = R_SETTING;
-  row.id = i;
-  switch (i) {
-    case S_THEME: row.icon = ICON_PALETTE; row.line1 = "Theme"; row.line2 = uiThemeName(uiStyle.theme); break;
-    case S_DENSITY:
-      row.icon = ICON_DENSITY;
-      row.line1 = "Density";
-      row.line2 = String(uiStyle.compact ? "Compact" : "Comfortable") + " \xC2\xB7 " + FULL_ROWS + " rows";
-      break;
-    case S_TEXT: row.icon = ICON_TEXT_SIZE; row.line1 = "Text size"; row.line2 = uiStyle.large ? "Large" : "Standard"; break;
-    case S_CORNERS: row.icon = ICON_CORNER; row.line1 = "Corners"; row.line2 = uiStyle.square ? "Square" : "Round"; break;
-    case S_BRIGHTNESS:
-      row.icon = ICON_BRIGHTNESS;
-      row.line1 = "Brightness";
-      row.line2 = uiBrightnessName(uiStyle.brightness);
-      break;
-    case S_SLEEP:
-      row.icon = ICON_BEDTIME;
-      row.line1 = "Screen off after";
-      row.line2 = uiStyle.sleep == 4 ? String("Never") : String(uiSleepName(uiStyle.sleep)) + " without a touch";
-      break;
-    case S_ART:
-      row.icon = ICON_DOWNLOAD;
-      row.line1 = "Album art downloads";
-      row.line2 = artFetchEnabled() ? "On, while nothing plays" : "Off";
-      break;
-    case S_WIFI:
-      row.icon = ICON_WIFI;
-      row.line1 = "WiFi network";
-      row.line2 = wifiSsid.length() ? wifiSsid : String("Not set up");
-      break;
-    case S_REBUILD:
-      row.icon = ICON_REFRESH;
-      row.line1 = "Rebuild library";
-      row.line2 = rebuildArmedAt ? "Tap again to rebuild" : "Re-reads every song's tags";
-      break;
-    case S_SYSTEM:
-      row.icon = ICON_MEMORY;
-      row.line1 = "System";
-      row.line2 = "Version " FIRMWARE_VERSION " \xC2\xB7 " + formatCount(Catalog::titleCount()) + " songs";
-      break;
-    default: return false;
+static uint8_t choiceCount(uint32_t id) {
+  switch (id) {
+    case S_THEME: return THEME_COUNT;
+    case S_DENSITY: case S_TEXT: case S_CORNERS: case S_ART: return 2;
+    case S_BRIGHTNESS: return 4;
+    case S_SLEEP: return 5;
+    default: return 0;
   }
+}
+
+static String choiceName(uint32_t id, uint8_t i) {
+  switch (id) {
+    case S_THEME: return uiThemeName(i);
+    case S_DENSITY: return i ? "Compact" : "Comfortable";
+    case S_TEXT: return i ? "Large" : "Standard";
+    case S_CORNERS: return i ? "Square" : "Round";
+    case S_BRIGHTNESS: return uiBrightnessName(i);
+    case S_SLEEP: return i == 4 ? String("Never") : String(uiSleepName(i)) + " without a touch";
+    case S_ART: return i ? "On, while nothing plays" : "Off";
+    default: return "";
+  }
+}
+
+static uint8_t choiceCurrent(uint32_t id) {
+  switch (id) {
+    case S_THEME: return uiStyle.theme;
+    case S_DENSITY: return uiStyle.compact;
+    case S_TEXT: return uiStyle.large;
+    case S_CORNERS: return uiStyle.square;
+    case S_BRIGHTNESS: return uiStyle.brightness;
+    case S_SLEEP: return uiStyle.sleep;
+    case S_ART: return artFetchEnabled();
+    default: return 0;
+  }
+}
+
+static const char *settingLabel(uint32_t id) {
+  static const char *const labels[SETTING_COUNT] = {
+    "Theme", "Density", "Text size", "Corners", "Brightness", "Screen off after",
+    "WiFi network", "Album art downloads", "Download now",
+    "Songs", "Artists", "Albums", "Rebuild library",
+    "Version", "Board", "Free memory", "SD card", "Running for"};
+  return id < SETTING_COUNT ? labels[id] : "";
+}
+
+static uint16_t settingIcon(uint32_t id) {
+  static const uint16_t icons[SETTING_COUNT] = {
+    ICON_PALETTE, ICON_DENSITY, ICON_TEXT_SIZE, ICON_CORNER, ICON_BRIGHTNESS, ICON_BEDTIME,
+    ICON_WIFI, ICON_IMAGE, ICON_DOWNLOAD,
+    ICON_MUSIC_NOTE, ICON_PERSON, ICON_ALBUM, ICON_REFRESH,
+    ICON_INFO, ICON_MEMORY, ICON_MEMORY, ICON_FOLDER, ICON_INFO};
+  return id < SETTING_COUNT ? icons[id] : ICON_INFO;
+}
+
+static String formatTime(uint32_t ms);
+static String settingValue(uint32_t id) {
+  if (choiceCount(id)) return choiceName(id, choiceCurrent(id));
+  switch (id) {
+    case S_WIFI: return wifiSsid.length() ? wifiSsid : String("Not set up");
+    case S_ART_NOW: return artFetchRunning() ? "Downloading..." : "Find missing covers and photos";
+    case S_REBUILD: return rebuildArmedAt ? "Tap again to rebuild" : "Re-reads every song's tags";
+    case S_SONGS: return formatCount(Catalog::titleCount());
+    case S_ARTISTS: return formatCount(Catalog::artistCount());
+    case S_ALBUMS: return formatCount(Catalog::albumIndexCount());
+    case S_VERSION: return FIRMWARE_VERSION;
+    case S_BOARD:
+      return String(ESP.getChipModel()) + ", " + (ESP.getFlashChipSize() >> 20) + " MB" +
+             (ESP.getPsramSize() ? ", PSRAM" : "");
+    case S_MEMORY: return String(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024) + " KB";
+    case S_CARD: return String(SD.cardSize() / (1024.0 * 1024 * 1024), 1) + " GB";
+    case S_UPTIME: return formatTime(millis());
+    default: return "";
+  }
+}
+
+static bool isInfoSetting(uint32_t id) {
+  return (id >= S_SONGS && id <= S_ALBUMS) || id >= S_VERSION;
+}
+
+static String groupSummary(uint8_t g) {
+  switch (g) {
+    case G_DISPLAY: return String(uiThemeName(uiStyle.theme)) + " \xC2\xB7 " + uiBrightnessName(uiStyle.brightness);
+    case G_WIFI: return (wifiSsid.length() ? wifiSsid : String("Not set up")) + " \xC2\xB7 art " + (artFetchEnabled() ? "on" : "off");
+    case G_LIBRARY: return formatCount(Catalog::titleCount()) + " songs";
+    case G_SYSTEM: return "Version " FIRMWARE_VERSION;
+    default: return "";
+  }
+}
+
+static bool settingsRow(const Level &l, uint32_t i, Row &row) {
+  if (l.kind == L_SETTINGS) {
+    if (i >= GROUP_COUNT) return false;
+    row.kind = R_GROUP;
+    row.id = i;
+    row.icon = kGroupIcons[i];
+    row.line1 = kGroupNames[i];
+    row.line2 = groupSummary(i);
+    return true;
+  }
+  if (l.kind == L_SETTINGS_GROUP) {
+    const uint32_t id = kGroupFirst[l.param] + i;
+    if (id >= kGroupFirst[l.param + 1]) return false;
+    row.kind = R_SETTING;
+    row.id = id;
+    row.icon = settingIcon(id);
+    row.line1 = settingLabel(id);
+    if (isInfoSetting(id)) {
+      row.right = settingValue(id);
+    } else {
+      row.line2 = settingValue(id);
+      row.chevron = choiceCount(id) || id == S_WIFI;
+    }
+    return true;
+  }
+  if (i >= choiceCount(l.param)) return false;  // L_SETTING_CHOICE
+  row.kind = R_CHOICE;
+  row.id = i;
+  row.line1 = choiceName(l.param, i);
+  row.checked = i == choiceCurrent(l.param);
   return true;
+}
+
+static uint32_t settingsCount(const Level &l) {
+  if (l.kind == L_SETTINGS) return GROUP_COUNT;
+  if (l.kind == L_SETTINGS_GROUP) return kGroupFirst[l.param + 1] - kGroupFirst[l.param];
+  return choiceCount(l.param);
 }
 
 // ---------------------------------------------------------------- Level contents
@@ -307,10 +409,12 @@ static int32_t levelCount(const Level &l) {
     case L_ARTISTS: return Catalog::artistCount();
     case L_ARTIST_ALBUMS: return Catalog::artist(l.param, a) ? HERO_ROWS + a.albumCount + 1 : 0;
     case L_ARTIST_SONGS: return Catalog::artist(l.param, a) ? a.songCount : 0;
-    case L_ALBUMS: return Catalog::albumCount();
+    case L_ALBUMS: return Catalog::albumIndexCount();
     case L_ALBUM_SONGS: return Catalog::album(l.param, al) ? HERO_ROWS + al.songCount : 0;
     case L_FOLDER: return Catalog::folder(l.param, f) ? f.childCount + f.songCount : 0;
-    case L_SETTINGS: return SETTING_COUNT;
+    case L_SETTINGS:
+    case L_SETTINGS_GROUP:
+    case L_SETTING_CHOICE: return settingsCount(l);
   }
   return 0;
 }
@@ -432,7 +536,9 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
       }
       return songRow(f.firstSong + (i - f.childCount), false, row);
     case L_SETTINGS:
-      return settingRow(i, row);
+    case L_SETTINGS_GROUP:
+    case L_SETTING_CHOICE:
+      return settingsRow(l, i, row);
     default: {  // song lists
       uint32_t songId;
       // Track numbers in an album, not in a "none" album (by title).
@@ -648,7 +754,8 @@ static void drawHeader() {
     uiDrawIcon(ICONS_24, ICON_BACK, 4, 4, pal.text);
     x = 32;
   }
-  const String count = tab.depth == 1 && l.kind != L_SETTINGS && l.kind != L_FOLDER ? formatCount(levelCount(l)) : String();
+  const bool counted = l.kind == L_SONGS || l.kind == L_ARTISTS || l.kind == L_ALBUMS;
+  const String count = tab.depth == 1 && counted ? formatCount(levelCount(l)) : String();
   int16_t room = statusX - 6 - x;
   if (count.length()) room -= uiTextWidth(FONT_SMALL, count.c_str()) + 5;
   if (tab.depth > 1 && hasHero(l)) {  // the page's own name is in its header: show where it came from
@@ -915,11 +1022,11 @@ static void composeArt(const Row *row, int16_t x, int16_t y, bool atRest, uint16
     if (!icon) {
       icon = person ? ICON_PERSON : row->kind == R_ALBUM ? ICON_ALBUM : row->kind == R_FOLDER ? ICON_FOLDER : ICON_MUSIC_NOTE;
     }
-    const bool accentIcon = row->kind == R_SETTING || icon == ICON_STACK;
+    const bool accentIcon = row->kind == R_SETTING || row->kind == R_GROUP || icon == ICON_STACK;
     canvas->fillRect(x, y, ART_THUMB, ART_THUMB, pal.surface2);
     uiDrawIcon(ICONS_18, icon, x + (ART_THUMB - 18) / 2, y + (ART_THUMB - 18) / 2, accentIcon ? pal.accent : pal.faint);
   }
-  roundCorners(x, y, ART_THUMB, row->kind == R_SETTING ? (uiStyle.square ? 0 : 6) : radius, bg);
+  roundCorners(x, y, ART_THUMB, row->kind == R_SETTING || row->kind == R_GROUP ? (uiStyle.square ? 0 : 6) : radius, bg);
 }
 
 // Composes list row `index` (data `row`, or nullptr for an empty row) into the
@@ -944,10 +1051,30 @@ static void composeRow(int32_t index, const Row *row, int16_t rowTop) {
     return;
   }
   const UiFont &body = uiFontBody(), &small = uiFontSmall();
-  const bool drill = row->kind != R_SONG && row->kind != R_SETTING;
-  const int16_t slotX = 8, textX = slotX + ART_THUMB + 9;
-  composeArt(row, slotX, (h - ART_THUMB) / 2, rowTop >= 0, bg);
+  const bool drill = row->kind == R_SETTING ? row->chevron : row->kind != R_SONG && row->kind != R_CHOICE;
+  const int16_t slotX = 8;
+  int16_t textX = slotX + ART_THUMB + 9;
   int16_t right = LIST_W - 6;
+  const int16_t slotY = (h - ART_THUMB) / 2;
+  if (row->kind == R_CHOICE) {
+    if (level().param == S_THEME) {  // a swatch of the theme
+      const UiPalette &p = uiThemePalette(row->id);
+      canvas->fillRect(slotX, slotY, ART_THUMB, ART_THUMB, p.bg);
+      canvas->fillRect(slotX + 5, slotY + 18, 20, 3, p.text);
+      canvas->fillRect(slotX + 5, slotY + 23, 13, 2, p.dim);
+      drawDot(slotX + 20, slotY + 10, 5, p.accent, p.bg);
+      canvas->drawRect(slotX, slotY, ART_THUMB, ART_THUMB, pal.line);
+      roundCorners(slotX, slotY, ART_THUMB, uiStyle.square ? 0 : 6, bg);
+    } else {
+      textX = 14;
+    }
+    if (row->checked) {
+      uiDrawIcon(ICONS_18, ICON_CHECK, LIST_W - 26, (h - 18) / 2, pal.accent);
+      right = LIST_W - 30;
+    }
+  } else {
+    composeArt(row, slotX, slotY, rowTop >= 0, bg);
+  }
   if (drill) {
     uiDrawIcon(ICONS_14, ICON_CHEVRON, LIST_W - 18, (h - 14) / 2, pal.faint);
     right = LIST_W - 22;
@@ -1952,40 +2079,58 @@ static void selectTab(int t) {
 
 // A tap on a Settings row changes it.
 static void logSetting(uint32_t id) {
-  Row row;
-  if (settingRow(id, row)) Serial.printf("[ui] %s: %s\n", row.line1.c_str(), row.line2.c_str());
+  Serial.printf("[ui] %s: %s\n", settingLabel(id), settingValue(id).c_str());
 }
 
-static void tapSetting(uint32_t id) {
-  struct LogAfter {
-    uint32_t id;
-    ~LogAfter() { logSetting(id); }
-  } logAfter{id};
+// A choice picked: applied at once; the list stays, so others can be tried.
+static void pickChoice(uint32_t id, uint8_t i) {
   UiStyle style = uiStyle;
   switch (id) {
-    case S_THEME: style.theme = (style.theme + 1) % THEME_COUNT; break;
-    case S_DENSITY: style.compact = !style.compact; break;
-    case S_TEXT: style.large = !style.large; break;
-    case S_CORNERS: style.square = !style.square; break;
-    case S_BRIGHTNESS:
-    case S_SLEEP:
-      if (id == S_BRIGHTNESS) style.brightness = (style.brightness + 1) % 4;
-      else style.sleep = (style.sleep + 1) % 5;
-      uiStyleSet(style);  // no redraw of the screen needed
-      drawRows();
-      return;
+    case S_THEME: style.theme = i; break;
+    case S_DENSITY: style.compact = i; break;
+    case S_TEXT: style.large = i; break;
+    case S_CORNERS: style.square = i; break;
+    case S_BRIGHTNESS: style.brightness = i; break;
+    case S_SLEEP: style.sleep = i; break;
     case S_ART: {
       CardSettings cs;
       cardSettingsLoad(cs);
-      cs.artDownload = !artFetchEnabled();
+      cs.artDownload = i;
       cardSettingsSave(cs);
       artFetchSetEnabled(cs.artDownload);
       if (!cs.artDownload) artFetchStop();
+      logSetting(id);
       drawHeader();
       drawRows();
       return;
     }
-    case S_WIFI: wifiSetupRequested = true; return;
+    default: return;
+  }
+  uiStyleSet(style);
+  logSetting(id);
+  if (id == S_BRIGHTNESS || id == S_SLEEP) {
+    drawRows();
+    return;
+  }
+  stripStale = true;
+  if (style.theme == THEME_COVER) uiThemeCover(currentThumb());
+  clearRowCache();
+  listMarquee.active = false;
+  uiShowPlayer();  // new colours or row heights: redraw everything
+}
+
+// A setting tapped: open its choices, or run it.
+static void tapSetting(uint32_t id) {
+  if (choiceCount(id)) {
+    pushLevel(L_SETTING_CHOICE, id, settingLabel(id));
+    return;
+  }
+  switch (id) {
+    case S_WIFI: wifiSetupRequested = true; break;
+    case S_ART_NOW:
+      artFetchNow();
+      drawRows();
+      break;
     case S_REBUILD:
       if (rebuildArmedAt && millis() - rebuildArmedAt < 4000) {
         rebuildArmedAt = 0;
@@ -1994,15 +2139,9 @@ static void tapSetting(uint32_t id) {
         rebuildArmedAt = millis() | 1;
       }
       drawRows();
-      return;
-    default: return;
+      break;
+    default: break;  // information
   }
-  uiStyleSet(style);
-  stripStale = true;
-  if (style.theme == THEME_COVER) uiThemeCover(currentThumb());
-  clearRowCache();
-  listMarquee.active = false;
-  uiShowPlayer();  // new colours or row heights: redraw everything
 }
 
 // Play all (in order) or Shuffle on an artist or album page.
@@ -2039,6 +2178,8 @@ static void tapRow(int r) {
     case R_ALBUM: pushLevel(L_ALBUM_SONGS, row.id, row.line1); break;
     case R_FOLDER: pushLevel(L_FOLDER, row.id, row.line1); break;
     case R_SETTING: tapSetting(row.id); break;
+    case R_GROUP: pushLevel(L_SETTINGS_GROUP, row.id, kGroupNames[row.id]); break;
+    case R_CHOICE: pickChoice(l.param, row.id); break;
     case R_ACTIONS: playAll(l, pressX >= 10 + (LIST_W - 2 * 10 - ACTIONS_GAP) / 2 + ACTIONS_GAP / 2); break;
     default: break;
   }
@@ -2215,7 +2356,7 @@ void uiTick() {
   }
   if (rebuildArmedAt && millis() - rebuildArmedAt >= 4000) {  // "Tap again" expired
     rebuildArmedAt = 0;
-    if (!nowOpen && level().kind == L_SETTINGS && !listMoving()) drawRows();
+    if (!nowOpen && level().kind == L_SETTINGS_GROUP && !listMoving()) drawRows();
   }
 
   // "Cover colour" theme: follow the playing album.

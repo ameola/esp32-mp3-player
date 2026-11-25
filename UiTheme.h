@@ -38,6 +38,7 @@ extern UiStyle uiStyle;
 void uiStyleLoad();                       // once at start
 void uiStyleSet(const UiStyle &style);    // applies and saves
 const char *uiThemeName(uint8_t theme);
+const UiPalette &uiThemePalette(uint8_t theme);  // for swatches
 const char *uiBrightnessName(uint8_t level);
 uint8_t uiBrightnessPercent(uint8_t level);
 const char *uiSleepName(uint8_t index);

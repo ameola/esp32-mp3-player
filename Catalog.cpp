@@ -125,6 +125,10 @@ bool album(uint32_t id, AlbumRecord &out) {
   return ensure(albums, LF_ALBUMS, sizeof(AlbumRecord)) && albums.read(id, &out);
 }
 
+uint32_t albumIndexCount() {
+  return ensure(albumIdx, LF_ALBUM_INDEX, sizeof(uint32_t)) ? albumIdx.count() : 0;
+}
+
 bool albumByName(uint32_t pos, uint32_t &id) {
   return ensure(albumIdx, LF_ALBUM_INDEX, sizeof(uint32_t)) && albumIdx.read(pos, &id);
 }
