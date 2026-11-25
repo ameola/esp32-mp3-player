@@ -12,7 +12,10 @@ void audioInit();
 
 // Stops any current song first. startOffset: byte offset of the first MPEG
 // frame (skips the ID3 tag, whose pictures can contain false frame syncs).
+// False if it can't: audioPlayError() then says why when it's the file
+// ("a WMA file, not an MP3"; "" for other failures).
 bool audioPlay(const char *path, uint32_t startOffset = 0);
+const char *audioPlayError();
 void audioStop();
 void audioPause();
 void audioResume();

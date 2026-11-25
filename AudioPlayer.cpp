@@ -560,8 +560,43 @@ void audioStop() {
   state = STOPPED;
 }
 
+static const char *playError = "";
+
+// Another format named .mp3 (seen: a WMA file): the decoder finds false
+// frame syncs all through it, plays noise and stutters, using half a core.
+// Its first bytes tell; nullptr if they look like an MP3 (or ID3 tag).
+static const char *otherFormat(const char *path) {
+  FIL *f = cardNewFil();
+  uint8_t b[12] = {};
+  UINT got = 0;
+  if (f && f_open(f, cardPath(path).c_str(), FA_READ) == FR_OK) {
+    f_read(f, b, sizeof(b), &got);
+    f_close(f);
+  }
+  cardDeleteFil(f);
+  if (got < sizeof(b)) return nullptr;  // let the decoder decide
+  static const uint8_t asf[] = {0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11};
+  if (!memcmp(b, asf, sizeof(asf))) return "WMA";
+  if (!memcmp(b, "fLaC", 4)) return "FLAC";
+  if (!memcmp(b, "OggS", 4)) return "Ogg";
+  if (!memcmp(b + 4, "ftyp", 4)) return "AAC";
+  if (!memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WAVE", 4)) return "WAV";
+  return nullptr;
+}
+
+const char *audioPlayError() {
+  return playError;
+}
+
 bool audioPlay(const char *path, uint32_t startOffset) {
   audioStop();
+  playError = "";
+  if (const char *format = otherFormat(path)) {
+    static char why[40];
+    snprintf(why, sizeof(why), "a %s file, not an MP3", format);
+    playError = why;
+    return false;
+  }
   if (!ensureEngine()) return false;
   AudioLock held;
   trackEnded = false;
