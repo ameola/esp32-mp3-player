@@ -1923,8 +1923,30 @@ static void drawNowVolume() {
 #define LYRICS_W (SCREEN_W - 32)
 struct LyricLine {
   uint32_t ms;
-  uint16_t text;  // offset in lyricText
+  uint16_t text;   // offset in lyricText
+  uint16_t entry;  // the lyric line it's part of (a long one wraps to several)
 };
+// The playing line is drawn larger and wrapped again in its own font.
+static const UiFont &lyricFont() { return uiStyle.large ? FONT_LARGE_BODY : FONT_BODY; }
+static const UiFont &lyricFontNow() { return uiStyle.large ? FONT_HEADLINE : FONT_TITLE; }
+static int16_t lyricRowH(bool now) { return now ? (uiStyle.large ? 28 : 26) : (uiStyle.large ? 24 : LYRIC_H); }
+static int16_t lyricBaseline(bool now) { return now ? (uiStyle.large ? 21 : 19) : (uiStyle.large ? 17 : 16); }
+
+// Splits text into lines that fit LYRICS_W in font f (at spaces when it can).
+static void wrapLyric(const UiFont &f, String rest, std::vector<String> &out) {
+  rest.trim();
+  do {
+    size_t cut = rest.length();
+    while (cut > 0 && uiTextWidth(f, rest.substring(0, cut).c_str()) > LYRICS_W) {
+      const int space = rest.lastIndexOf(' ', cut - 1);
+      cut = space > 0 ? space : cut - 1;
+    }
+    if (cut == 0) cut = rest.length();
+    out.push_back(rest.substring(0, cut));
+    rest = rest.substring(cut);
+    rest.trim();
+  } while (rest.length());
+}
 static char *lyricText = nullptr;
 static LyricLine *lyricLines = nullptr;
 static uint16_t lyricCount = 0;
@@ -2093,22 +2115,16 @@ static void lyricsParse(const String &text) {
   // Pass 2: wrap to the screen into one buffer.
   String wrapped;
   std::vector<LyricLine> lines;
-  for (const Entry &e : entries) {
-    String rest = e.text;
-    do {
-      size_t cut = rest.length();
-      while (cut > 0 && uiTextWidth(FONT_BODY, rest.substring(0, cut).c_str()) > LYRICS_W) {
-        const int space = rest.lastIndexOf(' ', cut - 1);
-        cut = space > 0 ? space : cut - 1;
-      }
-      if (cut == 0) cut = rest.length();
-      lines.push_back({e.ms, static_cast<uint16_t>(wrapped.length())});
-      wrapped += rest.substring(0, cut);
+  std::vector<String> parts;
+  for (size_t n = 0; n < entries.size() && lines.size() < LYRICS_MAX_LINES; n++) {
+    parts.clear();
+    wrapLyric(lyricFont(), entries[n].text, parts);
+    for (const String &part : parts) {
+      if (lines.size() >= LYRICS_MAX_LINES) break;
+      lines.push_back({entries[n].ms, static_cast<uint16_t>(wrapped.length()), static_cast<uint16_t>(n)});
+      wrapped += part;
       wrapped += '\0';
-      rest = rest.substring(cut);
-      rest.trim();
-    } while (rest.length() && lines.size() < LYRICS_MAX_LINES);
-    if (lines.size() >= LYRICS_MAX_LINES) break;
+    }
   }
   lyricText = static_cast<char *>(malloc(wrapped.length() + 1));
   lyricLines = static_cast<LyricLine *>(malloc(lines.size() * sizeof(LyricLine)));
@@ -2137,12 +2153,67 @@ static int currentLyric() {
   return cur;
 }
 
+// Rows on screen, for taps: y range in the lyrics area and the lyric line
+// (its first wrapped part's index).
+struct LyricRow {
+  int16_t y, h;
+  uint16_t first;
+};
+static LyricRow lyricRows[16];
+static uint8_t lyricRowCount = 0;
+
 static void drawLyrics(bool force) {
-  const int cur = currentLyric();
+  const int curLine = currentLyric();
+  const int cur = curLine >= 0 ? lyricLines[curLine].entry : -1;  // the playing lyric line
   if (!force && cur == lyricShown) return;
   lyricShown = cur;
-  const int perScreen = LYRICS_H / LYRIC_H;  // 7
-  lyricFirst = max(0, cur - perScreen / 2 + 1);
+  // Layout: the playing line (all its parts, larger) two rows from the top,
+  // or higher near the start; earlier lines above it, later ones below.
+  struct Row {
+    int16_t y, h, base;
+    const UiFont *font;
+    uint16_t color;
+    String text;
+    uint16_t first;
+  };
+  std::vector<Row> rows;
+  int start = 0;  // first wrapped part of the playing line
+  if (cur >= 0) {
+    start = curLine;
+    while (start > 0 && lyricLines[start - 1].entry == cur) start--;
+  }
+  int end = start;  // past its last part
+  while (end < lyricCount && cur >= 0 && lyricLines[end].entry == cur) end++;
+  int16_t above = 0;
+  for (int i = start - 1; i >= 0 && above < 2 * LYRIC_H; i--) above += lyricRowH(false);
+  int16_t y = min<int16_t>(above, 2 * LYRIC_H) - above;  // rows above may start off the top
+  int first = start;
+  for (int16_t h = 0; first > 0 && h < above; first--) h += lyricRowH(false);
+  auto addPlain = [&](int i) {
+    rows.push_back({y, lyricRowH(false), lyricBaseline(false), &lyricFont(), i < start ? pal.faint : pal.dim,
+                    String(lyricText + lyricLines[i].text), static_cast<uint16_t>(i)});
+    y += lyricRowH(false);
+  };
+  for (int i = first; i < start; i++) addPlain(i);
+  if (cur >= 0) {
+    String text;
+    for (int i = start; i < end; i++) {
+      if (text.length()) text += ' ';
+      text += lyricText + lyricLines[i].text;
+    }
+    std::vector<String> parts;
+    wrapLyric(lyricFontNow(), text, parts);
+    for (const String &part : parts) {
+      rows.push_back({y, lyricRowH(true), lyricBaseline(true), &lyricFontNow(), pal.accent, part, static_cast<uint16_t>(start)});
+      y += lyricRowH(true);
+    }
+  }
+  for (int i = end; i < lyricCount && y < LYRICS_H; i++) addPlain(i);
+  lyricRowCount = 0;
+  for (const Row &r : rows) {
+    if (r.y + r.h > 0 && r.y < LYRICS_H && lyricRowCount < 16) lyricRows[lyricRowCount++] = {r.y, r.h, r.first};
+  }
+  // Drawn in bands the canvas holds.
   for (int16_t band = 0; band < LYRICS_H; band += 2 * LYRIC_H) {
     const int16_t h = min<int16_t>(2 * LYRIC_H, LYRICS_H - band);
     canvas->fillRect(0, 0, SCREEN_W, h, pal.bg);
@@ -2152,11 +2223,9 @@ static void drawLyrics(bool force) {
         drawCentered(FONT_SMALL, "They download while the player is idle", SCREEN_W / 2, 34, pal.faint);
       }
     } else {
-      for (int k = 0; k < 2; k++) {
-        const int i = lyricFirst + band / LYRIC_H + k;
-        if (i >= lyricCount) break;
-        const uint16_t color = i == cur ? pal.accent : i < cur ? pal.faint : pal.dim;
-        uiDrawText(FONT_BODY, lyricText + lyricLines[i].text, 16, k * LYRIC_H + 16, color);
+      for (const Row &r : rows) {
+        if (r.y + r.h <= band || r.y >= band + h) continue;
+        uiDrawText(*r.font, r.text.c_str(), 16, r.y - band + r.base, r.color);
       }
     }
     lcdBlit(0, LYRICS_Y + band, SCREEN_W, h);
@@ -2500,7 +2569,7 @@ static void pickChoice(uint32_t id, uint8_t i) {
   switch (id) {
     case S_THEME: style.theme = i; break;
     case S_DENSITY: style.compact = i; break;
-    case S_TEXT: style.large = i; break;
+    case S_TEXT: style.large = i; lyricSongId = LIB_NONE; break;  // lyrics wrap again
     case S_CORNERS: style.square = i; break;
     case S_BRIGHTNESS: style.brightness = i; break;
     case S_SLEEP: style.sleep = i; break;
@@ -2820,7 +2889,11 @@ static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
     if (inPages) {  // no swipe: a tap
       inPages = false;
       if (nowLyrics && lyricSynced && swipeY0 < LYRICS_Y + LYRICS_H) {
-        const int i = lyricFirst + (swipeY0 - LYRICS_Y) / LYRIC_H;
+        const int16_t ty = swipeY0 - LYRICS_Y;
+        int i = -1;
+        for (int k = 0; k < lyricRowCount; k++) {
+          if (ty >= lyricRows[k].y && ty < lyricRows[k].y + lyricRows[k].h) i = lyricRows[k].first;
+        }
         if (i >= 0 && i < lyricCount) {
           seekTo(lyricLines[i].ms);
           NowDraw unmute;
