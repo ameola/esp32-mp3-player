@@ -913,8 +913,23 @@ bool makeMissingThumb(uint32_t key) {
 // per library generation (no WiFi), move them: albums and artists of the
 // library (thumbnail, cover/photo and "no picture" marker), then the
 // thumbnails songs look up for their own album (a "none" song's album isn't
-// in the library any more, but its cover may be on the card).
+// in the library any more, but its cover may be on the card). Pictures are
+// only saved under normalized keys now, so after one complete run nothing
+// is left to move: MIGRATED_MARK on the card skips it from then on (it took
+// ~70 s at the start of every pass after a reboot).
+#define MIGRATED_MARK ART_DIR "/keys-normalized"
 uint32_t migratedGen = LIB_NONE;
+
+bool migrationDone() {
+  FILINFO info;
+  return f_stat(cardPath(MIGRATED_MARK).c_str(), &info) == FR_OK;
+}
+
+void markMigrationDone() {
+  FIL *f = cardNewFil();
+  if (f && f_open(f, cardPath(MIGRATED_MARK).c_str(), FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) f_close(f);
+  cardDeleteFil(f);
+}
 
 bool moveFile(uint32_t from, uint32_t to, const char *ext) {
   FILINFO info;
@@ -1348,8 +1363,9 @@ PassResult runPass() {
     albums->setReadAhead(4096);
     f_mkdir(cardPath(ART_DIR).c_str());
     if (!ThumbStore::exists() && !ThumbStore::create(stopRequested)) return stopRequested ? P_STOPPED : P_BUSY;
-    if (migratedGen != passGen) {
+    if (migratedGen != passGen && !migrationDone()) {
       if (!migrateKeys(*albums, *artists)) return P_STOPPED;
+      markMigrationDone();
       migratedGen = passGen;
     }
     return P_DONE;
