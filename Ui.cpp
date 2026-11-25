@@ -2098,6 +2098,18 @@ static uint32_t lyricsKeyOf(const Track &t) {
 
 static void lyricsParse(const String &text);
 
+// A song just started: if it has no lyrics yet (no .lrc file, never looked
+// up), the next download pass looks it up first.
+static void wantLyricsIfMissing() {
+  if (!uiStyle.lyrics || !artFetchEnabled()) return;
+  const int dot = currentPath.lastIndexOf('.');
+  FILINFO info;
+  for (const char *ext : {".lrc", ".LRC"}) {
+    if (dot > 0 && f_stat(cardPath(currentPath.substring(0, dot) + ext).c_str(), &info) == FR_OK) return;
+  }
+  if (LyricStore::find(lyricsKeyOf(current), nullptr) == LYR_NOT_LOOKED) artLyricsWant(current.id);
+}
+
 // Loads and wraps the playing song's lyrics (none: lyricCount 0): an .lrc
 // file next to the song first, else downloaded ones.
 static void lyricsLoad() {
@@ -2310,9 +2322,19 @@ static void drawLyrics(bool force) {
     const int16_t h = min<int16_t>(2 * LYRIC_H, LYRICS_H - band);
     canvas->fillRect(0, 0, SCREEN_W, h, pal.bg);
     if (!lyricCount) {
-      if (band == 2 * LYRIC_H) {
-        drawCentered(FONT_BODY, "No lyrics for this song", SCREEN_W / 2, 16, pal.dim);
-        drawCentered(FONT_SMALL, "They download while the player is idle", SCREEN_W / 2, 34, pal.faint);
+      if (band == 2 * LYRIC_H) {  // why there are none
+        const char *a, *b;
+        if (lyricKind == LYR_INSTRUMENTAL) {
+          a = "Instrumental", b = "No words to show";
+        } else if (lyricKind == LYR_NONE || lyricKind == LYR_SYNCED || lyricKind == LYR_PLAIN) {
+          a = "No lyrics found", b = "An .lrc file next to the song shows here";
+        } else if (!artFetchEnabled()) {
+          a = "No lyrics yet", b = "Downloads are off (Settings: WiFi)";
+        } else {
+          a = "No lyrics yet", b = "They download while nothing plays";
+        }
+        drawCentered(FONT_BODY, a, SCREEN_W / 2, 16, lyricKind == LYR_INSTRUMENTAL ? pal.text : pal.dim);
+        drawCentered(FONT_SMALL, b, SCREEN_W / 2, 34, pal.faint);
       }
     } else {
       for (const Row &r : rows) {
@@ -2337,7 +2359,7 @@ static void seekTo(uint32_t ms) {
 // Two dots for the two pages (cover, lyrics), shown when the song has lyrics.
 static void drawNowDots(int16_t y) {
   canvas->fillRect(0, 0, SCREEN_W, 8, pal.bg);
-  if (uiStyle.lyrics && lyricCount) {
+  if (uiStyle.lyrics) {  // the lyrics page is there even without lyrics: it says why
     drawDot(SCREEN_W / 2 - 6, 4, 3, nowLyrics ? pal.faint : pal.accent, pal.bg);
     drawDot(SCREEN_W / 2 + 6, 4, 3, nowLyrics ? pal.accent : pal.faint, pal.bg);
   }
@@ -2378,7 +2400,7 @@ static void drawNow() {
       lyricSongId = current.id;
     }
   }
-  if (!lyricCount) nowLyrics = false;
+  if (!uiStyle.lyrics) nowLyrics = false;
   if (lyricCount && !nowLyrics && newSong && takeLyricHint()) {
     drawCentered(FONT_LABEL, "Swipe the cover for lyrics", SCREEN_W / 2, 19, pal.accent);
   } else {
@@ -2462,6 +2484,18 @@ static void refreshPlaying() {
 }
 
 // ================================================================ Actions
+// A short note in the status corner for a few seconds (when it's free).
+static String flashText;
+static uint32_t flashUntil = 0;
+static void drawHeader();
+static void flashStatus(const char *text) {
+  if (libraryStatus.length() && libraryStatus != flashText) return;  // the library's news first
+  flashText = libraryStatus = text;
+  flashUntil = millis() + 4000;
+  if (!nowOpen) drawHeader();
+}
+static bool stepForward(bool wrap);
+
 static void startPlayback() {
   uint32_t id;
   if (!ctxSong(playCtx, playIndex, id) || !Catalog::song(id, current)) {
@@ -2472,9 +2506,19 @@ static void startPlayback() {
   audioStop();
   currentPath = Catalog::songPath(id);
   Serial.println("Playing " + currentPath);
+  static uint32_t refusedInARow = 0;
   if (!audioPlay(currentPath.c_str(), current.audioStart)) {
-    Serial.println("  could not start playback");
+    const char *why = audioPlayError();
+    Serial.printf("  could not start playback%s%s\n", *why ? ": " : "", why);
+    // Not an MP3 after all: on to the next song (once round the list at most).
+    if (*why && ++refusedInARow < playCtx.count && stepForward(true)) {
+      flashStatus("Skipped:\nnot an MP3");
+      startPlayback();
+      return;
+    }
   }
+  refusedInARow = 0;
+  wantLyricsIfMissing();
   lastProgressPx = -1;
   refreshRows();  // move the playing highlight
   refreshPlaying();
@@ -3007,7 +3051,7 @@ static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
     if (inPages && abs(x - swipeX0) > 36 && abs(x - swipeX0) > 2 * abs(y - swipeY0)) {
       inPages = false;  // one page turn per swipe
       const bool lyrics = x < swipeX0;  // left: lyrics; right: the cover
-      if (lyrics != nowLyrics && (!lyrics || (uiStyle.lyrics && lyricCount))) {
+      if (lyrics != nowLyrics && (!lyrics || uiStyle.lyrics)) {
         nowLyrics = lyrics;
         drawNow();
       }
@@ -3205,6 +3249,10 @@ void uiTick() {
   }
   if (audioTakeTrackEnded()) {
     handleTrackEnded();
+  }
+  if (flashUntil && static_cast<int32_t>(millis() - flashUntil) >= 0) {
+    flashUntil = 0;
+    if (libraryStatus == flashText) uiSetLibraryStatus("");
   }
   if (statusHoldStart && millis() - statusHoldStart >= REBUILD_HOLD_MS) {
     statusHoldStart = 0;
