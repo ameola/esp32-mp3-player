@@ -131,9 +131,7 @@ static uint32_t getBe32(const uint8_t *p) {
 }
 
 static void lowerCopy(uint8_t *dst, size_t n, const char *src) {
-  for (size_t i = 0; i < n && src[i]; i++) {
-    dst[i] = tolower(static_cast<unsigned char>(src[i]));
-  }
+  libSortCopy(dst, n, src);  // accents folded: "Édith" sorts with "Edith"
 }
 
 static const char *stripThe(const char *s) {

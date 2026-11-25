@@ -25,12 +25,22 @@ const char *const kLibFileNames[LF_TYPE_COUNT] = {
 };
 
 uint8_t libBucket(const char *text) {
-  const char c = tolower(static_cast<unsigned char>(text[0]));
+  char first[5] = {};
+  memcpy(first, text, strnlen(text, 4));  // one character is enough
+  const String folded = foldAscii(first);
+  const char c = tolower(static_cast<unsigned char>(folded.length() ? folded[0] : 0));
   return (c >= 'a' && c <= 'z') ? 1 + (c - 'a') : 0;
 }
 
+void libSortCopy(uint8_t *dst, size_t n, const char *src) {
+  const String folded = foldAscii(src);
+  for (size_t i = 0; i < n && i < folded.length(); i++) {
+    dst[i] = tolower(static_cast<unsigned char>(folded[i]));
+  }
+}
+
 void libCopyField(char *dst, size_t size, const String &text) {
-  const size_t n = std::min(text.length(), size - 1);
+  const size_t n = utf8Prefix(text.c_str(), text.length(), size - 1);  // never half a character
   memcpy(dst, text.c_str(), n);
   memset(dst + n, 0, size - n);
 }

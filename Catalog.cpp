@@ -166,9 +166,7 @@ const JumpTable *jump(JumpKind kind) {
 static void titleKey(const char *title, uint8_t key[40]) {
   memset(key, 0, 40);
   key[0] = libBucket(title);
-  for (size_t i = 0; i < 39 && title[i]; i++) {
-    key[1 + i] = tolower(static_cast<unsigned char>(title[i]));
-  }
+  libSortCopy(key + 1, 39, title);
 }
 
 bool findTitlePos(const String &path, const String &title, uint32_t &pos) {

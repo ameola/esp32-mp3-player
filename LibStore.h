@@ -9,7 +9,9 @@
 #include "Tags.h"
 
 // Copies text into a fixed NUL-terminated record field, truncating to fit.
-void libCopyField(char *dst, size_t size, const String &text);
+void libCopyField(char *dst, size_t size, const String &text);  // cut on a UTF-8 character boundary
+// Copies up to n bytes of the accent-folded, lower-case form (for sort keys).
+void libSortCopy(uint8_t *dst, size_t n, const char *src);
 
 // Fills the tag-derived fields of a song record. `fileName` is the exact
 // on-card name (used for the title when the file has no title tag).

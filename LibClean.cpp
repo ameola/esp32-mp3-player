@@ -90,7 +90,7 @@ bool endsWithNoCase(const String &s, const char *suffix) {
 
 bool hasLetter(const String &s) {
   for (size_t i = 0; i < s.length(); i++) {
-    if (isalpha(static_cast<unsigned char>(s[i])) || s[i] == '?') return true;
+    if (isalpha(static_cast<unsigned char>(s[i])) || s[i] == '?' || static_cast<uint8_t>(s[i]) >= 0x80) return true;
   }
   return false;
 }
@@ -307,7 +307,8 @@ String splitDisc(const String &album, int &disc) {
 
 String libNormName(const char *name, bool dropThe) {
   String out;
-  const char *s = name;
+  const String folded = foldAscii(name);  // "Beyoncé" groups with "Beyonce"
+  const char *s = folded.c_str();
   if (dropThe && strncasecmp(s, "the ", 4) == 0 && s[4]) s += 4;
   for (; *s; s++) {
     const char c = *s;
@@ -357,7 +358,9 @@ void libCleanSong(SongRecord &rec, const char *fileName) {
   if (digits) {
     const String fromName = stripNumbers(stem, number);
     bool nameLetters = false;  // "9_16 - 36.mp3" says no more than "36"
-    for (size_t i = 0; i < fromName.length(); i++) nameLetters = nameLetters || isalpha(static_cast<unsigned char>(fromName[i]));
+    for (size_t i = 0; i < fromName.length(); i++) {
+      nameLetters = nameLetters || isalpha(static_cast<unsigned char>(fromName[i])) || static_cast<uint8_t>(fromName[i]) >= 0x80;
+    }
     if (nameLetters) title = stem;
   }
   title = stripNumbers(title, number);

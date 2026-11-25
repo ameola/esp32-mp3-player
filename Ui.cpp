@@ -2549,7 +2549,15 @@ static void dropSearch() {
   }
 }
 
+// Case- and accent-insensitive: "beyonce" finds "Beyoncé". `needle` is folded.
 static bool containsNoCase(const char *hay, const String &needle) {
+  bool ascii = true;
+  for (const char *p = hay; *p && ascii; p++) ascii = static_cast<uint8_t>(*p) < 0x80;
+  String folded;
+  if (!ascii) {
+    folded = foldAscii(hay);
+    hay = folded.c_str();
+  }
   const size_t n = needle.length();
   for (; *hay; hay++) {
     if (strncasecmp(hay, needle.c_str(), n) == 0) return true;
@@ -2636,7 +2644,7 @@ static void searchTouch(TouchPhase phase, int16_t x, int16_t y) {
         break;
       }
       drawSearchHint("Searching...", q);
-      if (!runSearch(q)) {
+      if (!runSearch(foldAscii(q.c_str()))) {
         drawSearchHint("Nothing found", q);
         break;
       }
