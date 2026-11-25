@@ -47,7 +47,7 @@ ICONS = {
     "EQUALIZER": (0xE01D, True), "BRIGHTNESS": (0xE3AB, False), "IMAGE": (0xE3F4, False),
     "CHECK": (0xE668, False), "PALETTE": (0xE40A, False), "DENSITY": (0xEB9E, False),
     "TEXT_SIZE": (0xE245, False), "CORNER": (0xE920, False), "DOWNLOAD": (0xF090, False),
-    "REFRESH": (0xE5D5, False), "MEMORY": (0xE322, False),
+    "REFRESH": (0xE5D5, False), "MEMORY": (0xE322, False), "BEDTIME": (0xF159, False),
 }
 ICON_SIZES = [14, 18, 24]
 

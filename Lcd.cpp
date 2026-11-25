@@ -78,6 +78,18 @@ static void initVendorIli9341() {
   writeLcdCommand(0x29, nullptr, 0);
 }
 
+static uint8_t backlightPercent = 100;
+static bool backlightReady = false;
+
+void lcdSetBacklight(uint8_t percent) {
+  backlightPercent = min<uint8_t>(percent, 100);
+  if (backlightReady) {
+    // Perceived brightness grows roughly with the square of the duty cycle.
+    const uint32_t duty = (static_cast<uint32_t>(backlightPercent) * backlightPercent * 255 + 5000) / 10000;
+    ledcWrite(TFT_BL, backlightPercent ? max<uint32_t>(duty, 3) : 0);
+  }
+}
+
 void lcdInit() {
   pinMode(TFT_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
@@ -96,7 +108,10 @@ void lcdInit() {
   digitalWrite(RESET_SHARED, HIGH);
   delay(500);
 
-  digitalWrite(TFT_BL, HIGH);
+  // PWM at 25 kHz: above hearing, so it can't whine through the amp.
+  ledcAttach(TFT_BL, 25000, 8);
+  backlightReady = true;
+  lcdSetBacklight(backlightPercent);
 
   // Same bring-up order as ComponentTest.
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, TFT_CS);

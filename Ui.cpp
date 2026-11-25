@@ -196,7 +196,7 @@ static bool isPlaying(uint32_t songId) {
 
 // ---------------------------------------------------------------- Settings tab
 // One row per setting; a tap changes it (themes and layouts apply at once).
-enum SettingId : uint8_t { S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_ART, S_WIFI, S_REBUILD, S_SYSTEM, SETTING_COUNT };
+enum SettingId : uint8_t { S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP, S_ART, S_WIFI, S_REBUILD, S_SYSTEM, SETTING_COUNT };
 static uint32_t rebuildArmedAt = 0;  // first tap on "Rebuild library"; a second within 4 s starts it
 static bool rebuildRequested = false;
 static bool wifiSetupRequested = false;
@@ -220,6 +220,16 @@ static bool settingRow(uint32_t i, Row &row) {
       break;
     case S_TEXT: row.icon = ICON_TEXT_SIZE; row.line1 = "Text size"; row.line2 = uiStyle.large ? "Large" : "Standard"; break;
     case S_CORNERS: row.icon = ICON_CORNER; row.line1 = "Corners"; row.line2 = uiStyle.square ? "Square" : "Round"; break;
+    case S_BRIGHTNESS:
+      row.icon = ICON_BRIGHTNESS;
+      row.line1 = "Brightness";
+      row.line2 = uiBrightnessName(uiStyle.brightness);
+      break;
+    case S_SLEEP:
+      row.icon = ICON_BEDTIME;
+      row.line1 = "Screen off after";
+      row.line2 = uiStyle.sleep == 4 ? String("Never") : String(uiSleepName(uiStyle.sleep)) + " without a touch";
+      break;
     case S_ART:
       row.icon = ICON_DOWNLOAD;
       row.line1 = "Album art downloads";
@@ -1751,13 +1761,29 @@ static void selectTab(int t) {
 }
 
 // A tap on a Settings row changes it.
+static void logSetting(uint32_t id) {
+  Row row;
+  if (settingRow(id, row)) Serial.printf("[ui] %s: %s\n", row.line1.c_str(), row.line2.c_str());
+}
+
 static void tapSetting(uint32_t id) {
+  struct LogAfter {
+    uint32_t id;
+    ~LogAfter() { logSetting(id); }
+  } logAfter{id};
   UiStyle style = uiStyle;
   switch (id) {
     case S_THEME: style.theme = (style.theme + 1) % THEME_COUNT; break;
     case S_DENSITY: style.compact = !style.compact; break;
     case S_TEXT: style.large = !style.large; break;
     case S_CORNERS: style.square = !style.square; break;
+    case S_BRIGHTNESS:
+    case S_SLEEP:
+      if (id == S_BRIGHTNESS) style.brightness = (style.brightness + 1) % 4;
+      else style.sleep = (style.sleep + 1) % 5;
+      uiStyleSet(style);  // no redraw of the screen needed
+      drawRows();
+      return;
     case S_ART: {
       CardSettings cs;
       cardSettingsLoad(cs);
@@ -1848,7 +1874,26 @@ static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
   }
 }
 
+// Screen off after the chosen time without a touch; the touch that wakes
+// it does nothing else.
+static uint32_t lastTouchAt = 0;
+static bool screenAsleep = false, swallowTouch = false;
+
 void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
+  lastTouchAt = millis();
+  if (screenAsleep) {
+    if (phase == TOUCH_DOWN) {
+      screenAsleep = false;
+      lcdSetBacklight(uiBrightnessPercent(uiStyle.brightness));
+      Serial.println("[ui] screen on (the waking touch is ignored)");
+      swallowTouch = true;
+    }
+    return;
+  }
+  if (swallowTouch) {
+    if (phase == TOUCH_UP) swallowTouch = false;
+    return;
+  }
   if (nowOpen) {
     nowTouch(phase, x, y);
     return;
@@ -1943,6 +1988,13 @@ void uiLibraryChanged() {
 }
 
 void uiTick() {
+  const uint32_t sleepMs = uiSleepMs(uiStyle.sleep);
+  if (!lastTouchAt) lastTouchAt = millis();
+  if (sleepMs && !screenAsleep && millis() - lastTouchAt > sleepMs) {
+    screenAsleep = true;
+    lcdSetBacklight(0);
+    Serial.println("[ui] screen off");
+  }
   if (audioTakeTrackEnded()) {
     handleTrackEnded();
   }

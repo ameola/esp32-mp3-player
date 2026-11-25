@@ -249,7 +249,7 @@ static void handleTouch(TouchPhase phase, int16_t x, int16_t y) {
 
 // Debug aid: inject touches over Serial: "tap x y", "drag x y1 y2 [ms]",
 // "audiocpu" (time spent decoding over 3 s), "artscan" (album art survey),
-// "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "libdump" (every song's cleaned tags and path),
+// "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "libdump" (every song's cleaned tags and path), "uistyle" (set or reset the UI style),
 // "mem" (free memory after each startup step, and now),
 // "hold x y ms". Prints the time taken and free heap afterwards.
 static void serviceSerialCommands() {
@@ -313,6 +313,17 @@ static void serviceSerialCommands() {
         if (id % 50 == 0) delay(1);
       }
       Serial.println("[dump] end");
+    } else if (line.startsWith("uistyle")) {  // "uistyle reset" or "uistyle theme compact large square bright sleep"
+      UiStyle st;
+      if (line != "uistyle reset") {
+        int v[6] = {st.theme, st.compact, st.large, st.square, st.brightness, st.sleep};
+        sscanf(line.c_str() + 7, "%d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+        st.theme = v[0]; st.compact = v[1]; st.large = v[2]; st.square = v[3]; st.brightness = v[4]; st.sleep = v[5];
+      }
+      uiStyleSet(st);
+      if (appState == PLAYER) uiShowPlayer();
+      Serial.printf("[ui] style: theme %u, compact %u, large %u, square %u, brightness %u, sleep %u\n", st.theme,
+                    st.compact, st.large, st.square, st.brightness, st.sleep);
     } else if (line == "mem") {
       Serial.print(memLog);
       memStep("now", false);

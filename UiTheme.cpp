@@ -2,6 +2,8 @@
 
 #include <Preferences.h>
 
+#include "Lcd.h"
+
 namespace {
 
 // The themes from the UI mockups (Settings > Display).
@@ -54,20 +56,26 @@ void uiStyleLoad() {
     uiStyle.compact = p.getBool("compact", false);
     uiStyle.large = p.getBool("large", false);
     uiStyle.square = p.getBool("square", false);
+    uiStyle.brightness = min<uint8_t>(p.getUChar("bright", 3), 3);
+    uiStyle.sleep = min<uint8_t>(p.getUChar("sleep", 4), 4);
     p.end();
   }
   apply();
+  lcdSetBacklight(uiBrightnessPercent(uiStyle.brightness));
 }
 
 void uiStyleSet(const UiStyle &style) {
   uiStyle = style;
   apply();
+  lcdSetBacklight(uiBrightnessPercent(uiStyle.brightness));
   Preferences p;
   if (p.begin("ui", false)) {
     p.putUChar("theme", uiStyle.theme);
     p.putBool("compact", uiStyle.compact);
     p.putBool("large", uiStyle.large);
     p.putBool("square", uiStyle.square);
+    p.putUChar("bright", uiStyle.brightness);
+    p.putUChar("sleep", uiStyle.sleep);
     p.end();
   }
 }
@@ -107,6 +115,26 @@ bool uiThemeCover(const uint16_t *px) {
   coverPal = next;
   if (uiStyle.theme == THEME_COVER) apply();
   return changed && uiStyle.theme == THEME_COVER;
+}
+
+const char *uiBrightnessName(uint8_t level) {
+  static const char *const names[] = {"Low", "Medium", "High", "Max"};
+  return names[min<uint8_t>(level, 3)];
+}
+
+uint8_t uiBrightnessPercent(uint8_t level) {
+  static const uint8_t percent[] = {30, 55, 80, 100};
+  return percent[min<uint8_t>(level, 3)];
+}
+
+const char *uiSleepName(uint8_t index) {
+  static const char *const names[] = {"30 s", "1 min", "5 min", "15 min", "Never"};
+  return names[min<uint8_t>(index, 4)];
+}
+
+uint32_t uiSleepMs(uint8_t index) {
+  static const uint32_t ms[] = {30000, 60000, 300000, 900000, 0};
+  return ms[min<uint8_t>(index, 4)];
 }
 
 int16_t uiRowH() {

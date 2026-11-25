@@ -13,6 +13,8 @@ extern GFXcanvas16 *canvas;  // SCREEN_W x CANVAS_H scratch area
 
 // Resets the panel (and touch controller, which shares the reset line),
 // runs the vendor init table, turns on the backlight and clears the screen.
+// Backlight brightness, 0 (off) to 100 %; may be called before lcdInit().
+void lcdSetBacklight(uint8_t percent);
 void lcdInit();
 
 void lcdFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);

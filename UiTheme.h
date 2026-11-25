@@ -28,6 +28,8 @@ struct UiStyle {
   bool compact = false;  // density: Comfortable (5 rows) / Compact (6)
   bool large = false;    // text size: Standard / Large
   bool square = false;   // corners: Round / Square
+  uint8_t brightness = 3;  // 0..3: Low, Medium, High, Max
+  uint8_t sleep = 4;       // screen off after: 30 s, 1 min, 5 min, 15 min, Never
 };
 
 extern UiPalette pal;  // the current theme's colours
@@ -36,6 +38,10 @@ extern UiStyle uiStyle;
 void uiStyleLoad();                       // once at start
 void uiStyleSet(const UiStyle &style);    // applies and saves
 const char *uiThemeName(uint8_t theme);
+const char *uiBrightnessName(uint8_t level);
+uint8_t uiBrightnessPercent(uint8_t level);
+const char *uiSleepName(uint8_t index);
+uint32_t uiSleepMs(uint8_t index);  // 0: never
 
 // "Cover colour" theme: colours from the playing album's 30 px thumbnail
 // (nullptr: no cover, fall back to Night radio). Returns true if the
