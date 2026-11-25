@@ -938,7 +938,18 @@ struct ThumbSlot {
   uint32_t used = 0;
 };
 static ThumbSlot thumbSlots[THUMB_SLOTS];
-static uint16_t *thumbPixels = nullptr;  // THUMB_SLOTS x ART_THUMB_BYTES, while needed
+static uint16_t *thumbPixels = nullptr;  // thumbSlotCount x ART_THUMB_BYTES, while needed
+// While a download pass runs, one slot (1.8 KB, not 14.4): its TLS
+// handshakes need the memory (archive.org's certificate check failed
+// without it).
+static uint8_t thumbSlotCount = 0;
+static uint8_t thumbSlotsWanted() { return artFetchRunning() ? 1 : THUMB_SLOTS; }
+static void dropThumbPixels() {
+  free(thumbPixels);
+  thumbPixels = nullptr;
+  thumbSlotCount = 0;
+  for (ThumbSlot &t : thumbSlots) t = ThumbSlot();
+}
 static uint32_t thumbClock = 0;
 static bool thumbPending = false;  // a row shows a placeholder it may not need
 static ThumbStore thumbStore;
@@ -952,9 +963,7 @@ static uint32_t thumbMissing[THUMB_MISSING];
 static uint8_t thumbMissingNext = 0;
 
 static void releaseThumbs() {
-  free(thumbPixels);
-  thumbPixels = nullptr;
-  for (ThumbSlot &t : thumbSlots) t = ThumbSlot();
+  dropThumbPixels();
   memset(thumbMissing, 0, sizeof(thumbMissing));  // pictures may have arrived meanwhile
   thumbStore.retry();                             // and the store been created
 }
@@ -963,12 +972,14 @@ static void releaseThumbs() {
 // *missing is set when it's known not to exist.
 static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
   *missing = false;
+  if (thumbPixels && thumbSlotCount != thumbSlotsWanted()) dropThumbPixels();
   if (!thumbPixels) {
-    thumbPixels = static_cast<uint16_t *>(malloc(THUMB_SLOTS * ART_THUMB_BYTES));
+    thumbPixels = static_cast<uint16_t *>(malloc(thumbSlotsWanted() * ART_THUMB_BYTES));
     if (!thumbPixels) return nullptr;
+    thumbSlotCount = thumbSlotsWanted();
   }
   int slot = -1;
-  for (int i = 0; i < THUMB_SLOTS; i++) {
+  for (int i = 0; i < thumbSlotCount; i++) {
     if (thumbSlots[i].key == key) slot = i;
   }
   if (slot < 0) {
@@ -984,7 +995,7 @@ static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
     }
     thumbLookups--;
     slot = 0;  // least recently used
-    for (int i = 1; i < THUMB_SLOTS; i++) {
+    for (int i = 1; i < thumbSlotCount; i++) {
       if (thumbSlots[i].used < thumbSlots[slot].used) slot = i;
     }
     if (!thumbStore.read(key, thumbPixels + slot * (ART_THUMB * ART_THUMB))) {
@@ -2088,6 +2099,7 @@ static bool parseStamp(const char *s, size_t n, uint32_t &ms) {
 }
 
 static LyricKind lyricKind = LYR_NOT_LOOKED;  // what's known of the playing song's
+static uint16_t lyricDay = 0;                 // when it was looked up (days since 1970)
 static uint32_t lyricsSavedSeen = 0;          // artLyricsSaved() when it was loaded
 
 // The download key: track artist (else album artist) and title, as the pass
@@ -2133,7 +2145,7 @@ static void lyricsLoad() {
   String text;
   if (!open) {  // downloaded ones (LyricStore), else ask the next idle pass for them
     cardDeleteFil(fil);
-    lyricKind = LyricStore::find(lyricsKeyOf(current), &text);
+    lyricKind = LyricStore::find(lyricsKeyOf(current), &text, &lyricDay);
     if (lyricKind == LYR_NOT_LOOKED && uiStyle.lyrics) artLyricsWant(current.id);
     // Known but not read (no memory during a download's TLS handshake):
     // tried again when the pass saves its next song.
@@ -2323,18 +2335,33 @@ static void drawLyrics(bool force) {
     canvas->fillRect(0, 0, SCREEN_W, h, pal.bg);
     if (!lyricCount) {
       if (band == 2 * LYRIC_H) {  // why there are none
-        const char *a, *b;
+        // Looked up and not found, versus not looked up yet (and why).
+        String a, b, c;
         if (lyricKind == LYR_INSTRUMENTAL) {
           a = "Instrumental", b = "No words to show";
         } else if (lyricKind == LYR_NONE || lyricKind == LYR_SYNCED || lyricKind == LYR_PLAIN) {
-          a = "No lyrics found", b = "An .lrc file next to the song shows here";
-        } else if (!artFetchEnabled()) {
-          a = "No lyrics yet", b = "Downloads are off (Settings: WiFi)";
+          a = "Lyrics not found online";
+          if (lyricDay) {
+            auto date = [](uint32_t day) {  // days since 1970 -> "25 Nov" (civil-from-days)
+              static const char *const months[] = {"Mar", "Apr", "May", "Jun", "Jul", "Aug",
+                                                   "Sep", "Oct", "Nov", "Dec", "Jan", "Feb"};
+              const uint32_t z = day + 719468, doe = z % 146097;
+              const uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+              const uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+              return String(doy - (153 * mp + 2) / 5 + 1) + " " + months[mp];
+            };
+            b = "Looked up " + date(lyricDay) + ", again after " + date(lyricDay + 30);
+          }
+          c = "An .lrc file next to the song shows here";
         } else {
-          a = "No lyrics yet", b = "They download while nothing plays";
+          a = "Lyrics not downloaded yet";
+          b = !artFetchEnabled() ? "Downloads are off (Settings: WiFi)"
+              : !wifiSsid.length() ? "No WiFi network set up"
+                                   : "They download while nothing plays";
         }
-        drawCentered(FONT_BODY, a, SCREEN_W / 2, 16, lyricKind == LYR_INSTRUMENTAL ? pal.text : pal.dim);
-        drawCentered(FONT_SMALL, b, SCREEN_W / 2, 34, pal.faint);
+        drawCentered(FONT_BODY, a.c_str(), SCREEN_W / 2, c.length() ? 13 : 16, lyricKind == LYR_INSTRUMENTAL ? pal.text : pal.dim);
+        if (b.length()) drawCentered(FONT_SMALL, b.c_str(), SCREEN_W / 2, c.length() ? 27 : 34, pal.faint);
+        if (c.length()) drawCentered(FONT_SMALL, c.c_str(), SCREEN_W / 2, 40, pal.faint);
       }
     } else {
       for (const Row &r : rows) {
@@ -3250,6 +3277,8 @@ void uiTick() {
   if (audioTakeTrackEnded()) {
     handleTrackEnded();
   }
+  // A download pass started: give its TLS the thumbnail cache's memory now.
+  if (thumbPixels && thumbSlotCount > thumbSlotsWanted() && !listMoving()) dropThumbPixels();
   if (flashUntil && static_cast<int32_t>(millis() - flashUntil) >= 0) {
     flashUntil = 0;
     if (libraryStatus == flashText) uiSetLibraryStatus("");

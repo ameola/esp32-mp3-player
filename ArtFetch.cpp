@@ -587,14 +587,43 @@ void wifiStop() {
 // GET with redirects followed by hand (so a stop request is seen between
 // reads). sink() gets the body of the final 200 answer; returns the status
 // (0 on a connection error, -1 when stopped).
+// Trusted root for the cover hosts (archive.org's HTTPS-only dn* nodes),
+// instead of the whole certificate bundle. Their chain is leaf <- YE2 <-
+// Root YE <- ISRG Root X2 <- ISRG Root X1; through the bundle, mbedTLS
+// checked up to X1's 4096-bit RSA signature, which ran out of memory.
+// Trusting Root YE (Let's Encrypt's ECDSA root of its 2025 hierarchy, here
+// as cross-signed by X2; valid to 2032-09-02, SHA-256 0F:C0:90:1C...) ends
+// the check there, with one ECDSA signature. (Through X2, mbedTLS rejected
+// the chain in an offline test.) Hosts with other chains fail and their
+// albums are tried again next pass (O_SKIPPED).
+const char kCoverRoot[] =
+"-----BEGIN CERTIFICATE-----\n"
+"MIICpjCCAiugAwIBAgIRAIchZfw0tuX7qK3Vs3BftTowCgYIKoZIzj0EAwMwTzEL\n"
+"MAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2VhcmNo\n"
+"IEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDIwHhcNMjYwNTEzMDAwMDAwWhcN\n"
+"MzIwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsGA1UEChMESVNSRzEQMA4G\n"
+"A1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAiA2IABDwS/6vhrcVqcbBo\n"
+"+wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7XyFjWsPYhIPt/wzOqxTd2\n"
+"b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW87j77GaOB6zCB6DAOBgNV\n"
+"HQ8BAf8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDwYDVR0TAQH/BAUwAwEB\n"
+"/zAdBgNVHQ4EFgQUo8gmWo6hTNA1Y/ybI8g6rlbzT1YwHwYDVR0jBBgwFoAUfEKW\n"
+"rt5LSDv6kviejM9ti6lyN5UwMgYIKwYBBQUHAQEEJjAkMCIGCCsGAQUFBzAChhZo\n"
+"dHRwOi8veDIuaS5sZW5jci5vcmcvMBMGA1UdIAQMMAowCAYGZ4EMAQIBMCcGA1Ud\n"
+"HwQgMB4wHKAaoBiGFmh0dHA6Ly94Mi5jLmxlbmNyLm9yZy8wCgYIKoZIzj0EAwMD\n"
+"aQAwZgIxAMU19WCtmxVND8UHBZRoma49Z7jPs64Dma0eTu1OChVbB/2J7GV3nvYK\n"
+"Ax54uk1G9QIxAO0miLVJu8PLNiXXXkiE/gsK3CTRTF/aeo4bMX42Zw40csRU6AC2\n"
+"6hSW1/IWaas6dg==\n"
+"-----END CERTIFICATE-----\n";
+
 uint8_t httpBuf[1024];
 bool logTiming = true;
 
 template <typename Sink>
-int httpGet(const String &url, Sink sink) {
+int httpGet(const String &url, Sink sink, const char *caPem = nullptr) {
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();
-  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  if (caPem) cfg.cert_pem = caPem;  // these roots only (esp-tls prefers a bundle when both are set)
+  else cfg.crt_bundle_attach = esp_crt_bundle_attach;
   cfg.user_agent = ART_USER_AGENT;
   cfg.timeout_ms = HTTP_TIMEOUT_MS;
   cfg.buffer_size = 1536;
@@ -617,6 +646,7 @@ int httpGet(const String &url, Sink sink) {
     }
     esp_http_client_fetch_headers(c);
     status = esp_http_client_get_status_code(c);
+    if (status < 0) status = 0;  // no answer (timed out, reset): a network error, not -1 (stopped)
     timing += " " + host + " " + status + " in " + (millis() - t0) + " ms;";
     if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
       esp_http_client_flush_response(c, nullptr);
@@ -683,7 +713,7 @@ int mbSearch(const String &query, int limit, GroupReader &reader) {
 // Downloads an image to "<key>.jpg" (through "<key>.tmp") and makes its
 // list thumbnail. Returns the HTTP status: 200 saved, -1 stopped, 0 also
 // for card errors; `info` describes what was saved.
-int saveImage(const String &url, uint32_t key, String &info) {
+int saveImage(const String &url, uint32_t key, String &info, const char *caPem = nullptr) {
   const String tmp = keyPath(key, "tmp");
   FIL *f = cardNewFil();
   if (!f || f_open(f, cardPath(tmp).c_str(), FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
@@ -698,7 +728,7 @@ int saveImage(const String &url, uint32_t key, String &info) {
     writeOk = cardWrite(f, d, n, &w) == FR_OK && w == static_cast<UINT>(n);
     bytes += n;
     return writeOk && bytes < 512 * 1024;
-  });
+  }, caPem);
   f_close(f);
   cardDeleteFil(f);
   if (status == 200 && writeOk && bytes) {
@@ -775,7 +805,7 @@ Outcome fetchAlbum(uint32_t key, const String &album, const String &artist) {
   // 2. Cover: coverartarchive.org redirects to archive.org, which needs HTTPS.
   const uint32_t t0 = millis();
   String info;
-  status = saveImage("http://coverartarchive.org/release-group/" + id + "/front-250", key, info);
+  status = saveImage("http://coverartarchive.org/release-group/" + id + "/front-250", key, info, kCoverRoot);
   if (status == 200) {
     Serial.printf("[art]   saved \"%s\": %s; free %u\n", title.c_str(), info.c_str(), freeHeap());
     return O_SAVED;
@@ -1553,6 +1583,15 @@ void artFetchNow() {
   finishedGen = LIB_NONE;
   retryAt = 0;
   if (!startPass()) Serial.println("[art] can't start (art off for this card, no WiFi saved, or library busy)");
+}
+
+void artFetchPicturesNow() {
+  artFetchStop();
+  cursorGen = Catalog::generation();
+  cursor = lyricsOn() ? Catalog::songCount() : 0;
+  cursorSongs = cursor;
+  albumsSkipped = lyricsOn();  // lyrics still to do: the next pass starts over
+  artFetchNow();
 }
 
 void artFetchArtistsNow() {

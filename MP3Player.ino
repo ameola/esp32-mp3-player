@@ -250,9 +250,10 @@ static void handleTouch(TouchPhase phase, int16_t x, int16_t y) {
 
 // Debug aid: inject touches over Serial: "tap x y", "drag x y1 y2 [ms]", "swipe y x1 x2",
 // "audiocpu" (time spent decoding over 3 s), "artscan" (album art survey),
-// "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "libdump" (every song's cleaned tags and path), "uistyle" (set or reset the UI style),
+// "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "artpictures" (from the covers, past the lyrics), "libdump" (every song's cleaned tags and path), "uistyle" (set or reset the UI style),
 // "mem" (free memory after each startup step, and now),
 // "hold x y ms". Prints the time taken and free heap afterwards.
+
 static void serviceSerialCommands() {
   static String line;
   while (Serial.available()) {
@@ -339,6 +340,8 @@ static void serviceSerialCommands() {
       artFetchStop();
       appState = WIFI_SETUP;
       wifiSetupBegin();
+    } else if (line == "artpictures") {  // test: a pass from the album covers (past the lyrics)
+      artFetchPicturesNow();
     } else if (line == "artartists") {  // test: a pass of the artist steps only
       artFetchArtistsNow();
     } else if (line == "artfetch") {  // start an album art pass now

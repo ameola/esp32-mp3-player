@@ -22,6 +22,9 @@ void artFetchNow();                   // start a pass without waiting (Serial "a
 // Test (Serial "artartists"): a pass that starts at the artist steps; the
 // albums skipped are looked at by the next pass.
 void artFetchArtistsNow();
+// Test (Serial "artpictures"): a pass that starts at the picture steps
+// (album covers), past the lyrics.
+void artFetchPicturesNow();
 void artFetchStop();                  // blocks until WiFi is off again
 bool artFetchRunning();
 // Asks for a song's lyrics first in the next pass (the playing song, when
