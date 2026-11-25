@@ -47,7 +47,8 @@ enum RowKind : uint8_t { R_NONE, R_SONG, R_ARTIST, R_ALBUM, R_ALL_SONGS, R_FOLDE
                          R_GROUP,     // Settings group (id: SettingGroup)
                          R_CHOICE,    // one choice of a setting (id: its index)
                          R_SECTION,   // search results: a category's heading (id: category)
-                         R_MORE };    // search results: "See all" (id: category)
+                         R_MORE,      // search results: "See all" (id: category)
+                         R_SLIDER };  // a setting set by dragging (id: SettingId)
 
 struct Level {
   ListKind kind = L_SONGS;
@@ -270,6 +271,15 @@ static void loadAudioSettings() {
   }
   applyAudioSettings();
 }
+// Audio settings are sliders on their group's page: position 0 at the left.
+static bool isSlider(uint32_t id) { return id == S_BASS || id == S_TREBLE || id == S_VOLUME_MAX; }
+static uint8_t sliderSteps(uint32_t id) { return id == S_VOLUME_MAX ? 3 : TONE_STEPS; }
+static uint8_t sliderPos(uint32_t id) {
+  return id == S_BASS ? bassIndex : id == S_TREBLE ? trebleIndex : 2 - volumeMaxIndex;  // louder to the right
+}
+static void setSliderPos(uint32_t id, uint8_t pos) {
+  (id == S_BASS ? bassIndex : id == S_TREBLE ? trebleIndex : volumeMaxIndex) = id == S_VOLUME_MAX ? 2 - pos : pos;
+}
 static void saveAudioSettings() {
   Preferences p;
   if (p.begin("audio", false)) {
@@ -314,7 +324,7 @@ static String choiceName(uint32_t id, uint8_t i) {
     case S_ART: return i ? "On, while nothing plays" : "Off";
     case S_LYRICS: return i ? "Swipe the cover to show" : "Off";
     case S_BASS: case S_TREBLE: return toneName(i);
-    case S_VOLUME_MAX: return i ? String(kVolumeMax[i]) + "% of full" : String("Full");
+    case S_VOLUME_MAX: return i ? String(kVolumeMax[i]) + "%" : String("Full");
     default: return "";
   }
 }
@@ -406,11 +416,13 @@ static bool settingsRow(const Level &l, uint32_t i, Row &row) {
   if (l.kind == L_SETTINGS_GROUP) {
     const uint32_t id = kGroupFirst[l.param] + i;
     if (id >= kGroupFirst[l.param + 1]) return false;
-    row.kind = R_SETTING;
+    row.kind = isSlider(id) ? R_SLIDER : R_SETTING;
     row.id = id;
     row.icon = settingIcon(id);
     row.line1 = settingLabel(id);
-    if (isInfoSetting(id)) {
+    if (row.kind == R_SLIDER) {
+      row.right = settingValue(id);
+    } else if (isInfoSetting(id)) {
       row.right = settingValue(id);
     } else {
       row.line2 = settingValue(id);
@@ -1165,6 +1177,35 @@ static void composeArt(const Row *row, int16_t x, int16_t y, bool atRest, uint16
 // canvas at (0,0). When rowTop >= 0 the row is at rest with its top at that
 // screen line and a playing row's title scrolls; while the list moves it's
 // drawn trimmed instead.
+// A slider row: icon, name and value on top, the track below (a dot per
+// step, filled from Flat for the tone, from the left for the volume).
+#define SLIDER_X0 (8 + ART_THUMB + 9)
+#define SLIDER_X1 (LIST_W - 14)
+static int16_t sliderX(uint8_t pos, uint8_t steps) {
+  return SLIDER_X0 + (SLIDER_X1 - SLIDER_X0) * pos / (steps - 1);
+}
+static void composeSlider(const Row &row, uint16_t bg) {
+  const int16_t h = ROW_H;
+  const UiFont &body = uiFontBody(), &small = uiFontSmall();
+  uiDrawIcon(ICONS_24, row.icon, 8 + (ART_THUMB - 24) / 2, (h - 24) / 2, pal.dim);
+  const int16_t base = h / 2 - 3;
+  const int16_t vw = uiTextWidth(small, row.right.c_str());
+  uiDrawText(small, row.right.c_str(), SLIDER_X1 + 6 - vw, base, pal.accent);
+  uiDrawText(body, uiFitText(body, row.line1, SLIDER_X1 - SLIDER_X0 - vw - 8).c_str(), SLIDER_X0, base, pal.text);
+  const uint8_t steps = sliderSteps(row.id), pos = sliderPos(row.id);
+  const int16_t ty = h - 11;  // track centre
+  canvas->fillRoundRect(SLIDER_X0, ty - 2, SLIDER_X1 - SLIDER_X0, 4, 2, pal.line);
+  const int16_t from = row.id == S_VOLUME_MAX ? SLIDER_X0 : sliderX(steps / 2, steps), at = sliderX(pos, steps);
+  canvas->fillRoundRect(min(from, at), ty - 2, abs(at - from) + 1, 4, 2, pal.accent);
+  for (uint8_t i = 0; i < steps; i++) {
+    const int16_t x = sliderX(i, steps);
+    const bool lit = (x >= min(from, at) && x <= max(from, at));
+    canvas->fillCircle(x, ty, 2, lit ? pal.accent : pal.faint);
+  }
+  canvas->fillCircle(at, ty, uiStyle.compact ? 6 : 7, pal.accent);  // compact rows: clear of the name's descenders
+  canvas->fillCircle(at, ty, 3, bg);
+}
+
 static void composeRow(int32_t index, const Row *row, int16_t rowTop) {
   const int16_t h = ROW_H;
   const bool playing = row && row->kind == R_SONG && isPlaying(row->id);
@@ -1193,6 +1234,10 @@ static void composeRow(int32_t index, const Row *row, int16_t rowTop) {
   if (row->kind == R_MORE) {
     uiDrawText(FONT_BODY, row->line1.c_str(), 12, h / 2 + 5, pal.accent);
     uiDrawIcon(ICONS_14, ICON_CHEVRON, LIST_W - 18, (h - 14) / 2, pal.accent);
+    return;
+  }
+  if (row->kind == R_SLIDER) {
+    composeSlider(*row, bg);
     return;
   }
   const UiFont &body = uiFontBody(), &small = uiFontSmall();
@@ -2994,6 +3039,38 @@ static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
   }
 }
 
+// A finger on a slider row moves its knob to the nearest step (applied at
+// once, so it can be heard); saved when it lifts. False if the touch isn't
+// on a slider.
+static int sliderRow = -1;  // screen row being dragged
+static uint32_t sliderId = 0;
+static bool sliderTouch(TouchPhase phase, int16_t x, int16_t y) {
+  if (phase == TOUCH_DOWN) {
+    stopList();
+    const Level &l = level();
+    const int r = (y - LIST_Y) / ROW_H;
+    Row row;
+    if (l.kind != L_SETTINGS_GROUP || !levelRow(l, l.top + r, row) || row.kind != R_SLIDER) return false;
+    sliderRow = r;
+    sliderId = row.id;
+  }
+  if (phase == TOUCH_UP) {
+    sliderRow = -1;
+    saveAudioSettings();
+    logSetting(sliderId);
+    return true;
+  }
+  const uint8_t steps = sliderSteps(sliderId);
+  const int span = SLIDER_X1 - SLIDER_X0;
+  const uint8_t pos = constrain((x - SLIDER_X0) * (steps - 1) * 2 / span + 1, 0, 2 * (steps - 1)) / 2;
+  if (pos != sliderPos(sliderId)) {
+    setSliderPos(sliderId, pos);
+    applyAudioSettings();
+    drawRow(sliderRow);
+  }
+  return true;
+}
+
 // Screen off after the chosen time without a touch; the touch that wakes
 // it does nothing else.
 static uint32_t lastTouchAt = 0;
@@ -3022,6 +3099,10 @@ void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
     nowTouch(phase, x, y);
     return;
   }
+  if (sliderRow >= 0) {  // a slider has the finger until it lifts
+    sliderTouch(phase, x, y);
+    return;
+  }
   if (phase == TOUCH_UP) {
     if (motion == M_PRESS || motion == M_DRAG) {
       listTouchUp();
@@ -3044,6 +3125,7 @@ void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
   }
   // TOUCH_DOWN
   if (y >= LIST_Y && y < LIST_END && x < LIST_W) {
+    if (sliderTouch(TOUCH_DOWN, x, y)) return;
     listTouchDown(x, y);  // a tap fires on release if the finger didn't move
     return;
   }
