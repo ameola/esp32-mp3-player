@@ -20,6 +20,8 @@ struct Session {
   int16_t outW, outH;          // thumbnail mode: size of the decoded image
   int16_t x0, y0;              // screen position of the image's (0, 0) after scaling
   int16_t boxX, boxY, boxW, boxH;
+  uint16_t *buf;               // buffer mode: size x size RGB565, image centre-cropped into it
+  int16_t bufSize;
   uint16_t block[16 * 16];     // one MCU, RGB565
 };
 
@@ -50,6 +52,23 @@ UINT output(JDEC *jd, void *bitmap, JRECT *rect) {
     }
   }
   lcdPushPixels(left, top, cw, ch, s->block);
+  return 1;
+}
+
+// Buffer mode: decoded pixels into the buffer, (x0, y0) = image offset.
+UINT bufOutput(JDEC *jd, void *bitmap, JRECT *rect) {
+  Session *s = static_cast<Session *>(jd->device);
+  const int w = rect->right - rect->left + 1, h = rect->bottom - rect->top + 1;
+  const uint8_t *rgb = static_cast<const uint8_t *>(bitmap);
+  for (int row = 0; row < h; row++) {
+    const int y = s->y0 + rect->top + row;
+    if (y < 0 || y >= s->bufSize) continue;
+    const uint8_t *p = rgb + row * w * 3;
+    for (int i = 0; i < w; i++, p += 3) {
+      const int x = s->x0 + rect->left + i;
+      if (x >= 0 && x < s->bufSize) s->buf[y * s->bufSize + x] = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
+    }
+  }
   return 1;
 }
 
@@ -436,6 +455,33 @@ ArtDrawResult artDrawJpeg(const String &path, int16_t boxX, int16_t boxY, int16_
   free(s);
   res.ms = millis() - t0;
   return res;
+}
+
+bool artDecodeJpeg(const String &path, uint16_t *out, int16_t size, uint16_t bg) {
+  for (int i = 0; i < size * size; i++) out[i] = bg;
+  Session *s = static_cast<Session *>(malloc(sizeof(Session)));
+  void *pool = malloc(POOL_BYTES);
+  FIL *fil = cardNewFil();
+  bool ok = false;
+  if (s && pool && fil && f_open(fil, path.c_str(), FA_READ) == FR_OK) {
+    s->fil = fil;
+    s->buf = out;
+    s->bufSize = size;
+    JDEC jd;
+    if (jd_prepare(&jd, input, pool, POOL_BYTES, s) == JDR_OK) {
+      // The most scaling down that still covers the buffer, then crop the centre.
+      uint8_t scale = 0;
+      while (scale < 3 && (min<int>(jd.width, jd.height) >> (scale + 1)) >= size) scale++;
+      s->x0 = (size - (jd.width >> scale)) / 2;
+      s->y0 = (size - (jd.height >> scale)) / 2;
+      ok = jd_decomp(&jd, bufOutput, scale) == JDR_OK;
+    }
+    f_close(fil);
+  }
+  cardDeleteFil(fil);
+  free(pool);
+  free(s);
+  return ok;
 }
 
 String artThumbPath(const String &coverPath) {

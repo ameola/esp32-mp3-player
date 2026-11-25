@@ -29,5 +29,7 @@ String artFetchStatus();
 // for none (no album name, "Unknown Artist").
 uint32_t artAlbumKey(const char *albumArtist, const char *album);
 uint32_t artArtistKey(const char *artist);
+// Cache path of an artist's photo ("" for "Unknown Artist"; it may not exist).
+String artArtistPhotoPath(const char *artist);
 // Cache path of an album's cover ("" if the name is empty).
 String artCoverPath(const char *albumArtist, const char *album);

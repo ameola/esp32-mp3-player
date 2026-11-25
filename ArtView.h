@@ -24,6 +24,11 @@ ArtDrawResult artDrawJpeg(const String &cardPath, int16_t boxX, int16_t boxY, in
 #define ART_THUMB 30
 #define ART_THUMB_BYTES (ART_THUMB * ART_THUMB * 2)
 
+// Decodes a JPEG (FatFs path) into `out`, size x size RGB565, scaled down
+// by up to 1/8 so it still covers the square, centre-cropped; bg where the
+// image doesn't reach. ~40 ms for a 250 px cover (decoded at 1/4).
+bool artDecodeJpeg(const String &path, uint16_t *out, int16_t size, uint16_t bg);
+
 String artThumbPath(const String &coverPath);  // ".jpg" -> ".thm"
 // Makes the thumbnail of a JPEG (FatFs path): TJpgDec at up to 1/8 scale
 // and a box filter, ~100-150 ms for 250 px; progressive files (TJpgDec

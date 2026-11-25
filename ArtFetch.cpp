@@ -1099,6 +1099,11 @@ uint32_t artArtistKey(const char *artist) {
   return artistKey(artist);
 }
 
+String artArtistPhotoPath(const char *artist) {
+  if (!artist || placeholder(artist)) return "";
+  return keyPath(artistKey(artist), "jpg");
+}
+
 String artCoverPath(const char *albumArtist, const char *album) {
   if (!album || !album[0]) return "";
   return keyPath(albumKey(albumArtist ? albumArtist : "", album), "jpg");

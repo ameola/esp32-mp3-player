@@ -31,7 +31,9 @@ enum ListKind : uint8_t {
   L_SETTINGS,       // the Settings tab
 };
 
-enum RowKind : uint8_t { R_NONE, R_SONG, R_ARTIST, R_ALBUM, R_ALL_SONGS, R_FOLDER, R_SETTING };
+enum RowKind : uint8_t { R_NONE, R_SONG, R_ARTIST, R_ALBUM, R_ALL_SONGS, R_FOLDER, R_SETTING,
+                         R_HERO,      // page header (id: 0 top half, 1 bottom half)
+                         R_ACTIONS }; // Play all / Shuffle
 
 struct Level {
   ListKind kind = L_SONGS;
@@ -283,8 +285,16 @@ static PlayContext levelContext(const Level &l) {
 }
 
 // Rows before the first song row (a folder lists its subfolders first).
+// Artist and album pages start with a header: two rows of photo and names,
+// then a row of Play all / Shuffle buttons.
+#define HERO_ROWS 3
+static bool hasHero(const Level &l) {
+  return l.kind == L_ARTIST_ALBUMS || l.kind == L_ALBUM_SONGS;
+}
+
 static uint32_t songRowOffset(const Level &l) {
   FolderRecord f;
+  if (l.kind == L_ALBUM_SONGS) return HERO_ROWS;
   return (l.kind == L_FOLDER && Catalog::folder(l.param, f)) ? f.childCount : 0;
 }
 
@@ -295,10 +305,10 @@ static int32_t levelCount(const Level &l) {
   switch (l.kind) {
     case L_SONGS: return Catalog::titleCount();
     case L_ARTISTS: return Catalog::artistCount();
-    case L_ARTIST_ALBUMS: return Catalog::artist(l.param, a) ? a.albumCount + 1 : 0;
+    case L_ARTIST_ALBUMS: return Catalog::artist(l.param, a) ? HERO_ROWS + a.albumCount + 1 : 0;
     case L_ARTIST_SONGS: return Catalog::artist(l.param, a) ? a.songCount : 0;
     case L_ALBUMS: return Catalog::albumCount();
-    case L_ALBUM_SONGS: return Catalog::album(l.param, al) ? al.songCount : 0;
+    case L_ALBUM_SONGS: return Catalog::album(l.param, al) ? HERO_ROWS + al.songCount : 0;
     case L_FOLDER: return Catalog::folder(l.param, f) ? f.childCount + f.songCount : 0;
     case L_SETTINGS: return SETTING_COUNT;
   }
@@ -371,17 +381,23 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
       return true;
     case L_ARTIST_ALBUMS:
       if (!Catalog::artist(l.param, a)) return false;
-      if (i == 0) {
+      if (i < HERO_ROWS) {
+        row.kind = i < 2 ? R_HERO : R_ACTIONS;
+        row.id = i;
+        return true;
+      }
+      i -= HERO_ROWS;
+      if (i == a.albumCount) {
         row.kind = R_ALL_SONGS;
         row.id = l.param;
         row.line1 = "All songs";
         row.line2 = plural(a.songCount, "song");
-        row.art = artArtistKey(a.name);
+        row.icon = ICON_MUSIC_NOTE;
         return true;
       }
-      if (!Catalog::album(a.firstAlbum + i - 1, al)) return false;
+      if (!Catalog::album(a.firstAlbum + i, al)) return false;
       row.kind = R_ALBUM;
-      row.id = a.firstAlbum + i - 1;
+      row.id = a.firstAlbum + i;
       row.line1 = al.name;
       row.line2 = (al.year ? String(al.year) + ", " : String("")) + plural(al.songCount, "song");
       if (al.flags & ALBUM_NONE) row.icon = ICON_STACK;
@@ -420,9 +436,14 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
     default: {  // song lists
       uint32_t songId;
       // Track numbers in an album, not in a "none" album (by title).
+      if (hasHero(l) && i < HERO_ROWS) {
+        row.kind = i < 2 ? R_HERO : R_ACTIONS;
+        row.id = i;
+        return true;
+      }
       const bool tracks = l.kind == L_ALBUM_SONGS && Catalog::album(l.param, al) &&
                           !(al.flags & (ALBUM_NONE | ALBUM_NONE_ALL));
-      return ctxSong(levelContext(l), i, songId) && songRow(songId, tracks, row);
+      return ctxSong(levelContext(l), i - songRowOffset(l), songId) && songRow(songId, tracks, row);
     }
   }
 }
@@ -630,6 +651,12 @@ static void drawHeader() {
   const String count = tab.depth == 1 && l.kind != L_SETTINGS && l.kind != L_FOLDER ? formatCount(levelCount(l)) : String();
   int16_t room = statusX - 6 - x;
   if (count.length()) room -= uiTextWidth(FONT_SMALL, count.c_str()) + 5;
+  if (tab.depth > 1 && hasHero(l)) {  // the page's own name is in its header: show where it came from
+    const String &parent = tab.stack[tab.depth - 2].title;
+    uiDrawText(FONT_BODY, uiFitText(FONT_BODY, parent, room).c_str(), x, 21, pal.dim);
+    lcdBlit(0, 0, SCREEN_W, HEADER_H);
+    return;
+  }
   const int16_t after = uiDrawText(FONT_TITLE, uiFitText(FONT_TITLE, l.title, room).c_str(), x, 22, pal.text);
   if (count.length()) uiDrawText(FONT_SMALL, count.c_str(), after + 5, 22, pal.dim);
   lcdBlit(0, 0, SCREEN_W, HEADER_H);
@@ -722,6 +749,156 @@ static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
   return thumbPixels + slot * (ART_THUMB * ART_THUMB);
 }
 
+// ---------------------------------------------------------------- Page header
+// Artist and album pages: a 60 px photo or cover, the name and a details
+// line over two rows, then Play all / Shuffle. The picture is decoded once
+// per page (artist photo or album cover JPEG at 1/4; else the 30 px
+// thumbnail enlarged) into a 7 KB buffer, freed when the page is left.
+#define HERO_PHOTO 60
+struct HeroInfo {
+  ListKind kind = L_SONGS;
+  uint32_t param = LIB_NONE;
+  String name, sub;
+  bool round = false;
+  uint16_t icon = ICON_MUSIC_NOTE;
+  uint16_t *photo = nullptr;
+};
+static HeroInfo hero;
+
+static void heroFree() {
+  free(hero.photo);
+  hero = HeroInfo();
+}
+
+// 30 px thumbnail to 60 px, bilinear.
+static void enlargeThumb(const uint16_t *src, uint16_t *dst) {
+  for (int y = 0; y < HERO_PHOTO; y++) {
+    const float fy = max(0.0f, (y + 0.5f) / 2 - 0.5f);
+    const int y0 = min<int>(fy, ART_THUMB - 1), y1 = min<int>(y0 + 1, ART_THUMB - 1);
+    const uint8_t ty = (fy - y0) * 15;
+    for (int x = 0; x < HERO_PHOTO; x++) {
+      const float fx = max(0.0f, (x + 0.5f) / 2 - 0.5f);
+      const int x0 = min<int>(fx, ART_THUMB - 1), x1 = min<int>(x0 + 1, ART_THUMB - 1);
+      const uint8_t tx = (fx - x0) * 15;
+      const uint16_t top = uiBlend(src[y0 * ART_THUMB + x0], src[y0 * ART_THUMB + x1], tx);
+      const uint16_t bottom = uiBlend(src[y1 * ART_THUMB + x0], src[y1 * ART_THUMB + x1], tx);
+      dst[y * HERO_PHOTO + x] = uiBlend(top, bottom, ty);
+    }
+  }
+}
+
+static void loadHero(const Level &l) {
+  if (hero.kind == l.kind && hero.param == l.param) return;
+  heroFree();
+  hero.kind = l.kind;
+  hero.param = l.param;
+  ArtistRecord a;
+  AlbumRecord al;
+  String jpg;
+  uint32_t key = 0;
+  if (l.kind == L_ARTIST_ALBUMS && Catalog::artist(l.param, a)) {
+    hero.name = a.name;
+    hero.sub = plural(a.albumCount, "album") + " \xC2\xB7 " + plural(a.songCount, "song");
+    hero.round = true;
+    hero.icon = ICON_PERSON;
+    jpg = artArtistPhotoPath(a.name);
+    key = artArtistKey(a.name);
+  } else if (l.kind == L_ALBUM_SONGS && Catalog::album(l.param, al)) {
+    hero.name = al.name;
+    if (al.flags & ALBUM_NONE_ALL) {
+      hero.sub = formatCount(al.songCount) + " songs \xC2\xB7 every artist, A\xE2\x80\x93Z";
+      hero.icon = ICON_STACK;
+    } else if (Catalog::artist(al.artistId, a)) {
+      if (al.flags & ALBUM_NONE) {
+        hero.sub = String(a.name) + " \xC2\xB7 " + plural(al.songCount, "song") + ", A\xE2\x80\x93Z";
+        hero.icon = ICON_STACK;
+      } else {
+        hero.sub = String(a.name) + (al.year ? " \xC2\xB7 " + String(al.year) : String("")) + " \xC2\xB7 " +
+                   plural(al.songCount, "song");
+        hero.icon = ICON_ALBUM;
+        jpg = artCoverPath(a.name, al.name);
+        key = artAlbumKey(a.name, al.name);
+      }
+    }
+  }
+  FILINFO fi;
+  if (jpg.length() && f_stat(cardPath(jpg).c_str(), &fi) == FR_OK) {
+    hero.photo = static_cast<uint16_t *>(malloc(HERO_PHOTO * HERO_PHOTO * 2));
+    if (hero.photo && !artDecodeJpeg(cardPath(jpg), hero.photo, HERO_PHOTO, pal.surface2)) {
+      free(hero.photo);
+      hero.photo = nullptr;
+    }
+  }
+  if (!hero.photo && key) {
+    bool missing;
+    const uint16_t *px = thumbFor(key, true, &missing);
+    if (px && (hero.photo = static_cast<uint16_t *>(malloc(HERO_PHOTO * HERO_PHOTO * 2)))) enlargeThumb(px, hero.photo);
+  }
+}
+
+// Rounded corners on a rectangle (r <= half its smaller side).
+static void roundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t bg) {
+  if (r <= 0) return;
+  uint16_t *buf = canvas->getBuffer();
+  const int16_t cw = canvas->width(), ch = canvas->height();
+  auto blend = [&](int16_t px, int16_t py, uint8_t a) {
+    if (px >= 0 && px < cw && py >= 0 && py < ch) buf[py * cw + px] = uiBlend(buf[py * cw + px], bg, a);
+  };
+  for (int16_t j = 0; j < r; j++) {
+    for (int16_t i = 0; i < r; i++) {
+      const float dx = r - i - 0.5f, dy = r - j - 0.5f;
+      const float inside = constrain(r - sqrtf(dx * dx + dy * dy) + 0.5f, 0.0f, 1.0f);
+      if (inside >= 1) continue;
+      const uint8_t a = lroundf((1 - inside) * 15);
+      blend(x + i, y + j, a);
+      blend(x + w - 1 - i, y + j, a);
+      blend(x + i, y + h - 1 - j, a);
+      blend(x + w - 1 - i, y + h - 1 - j, a);
+    }
+  }
+}
+
+// Half `part` (0 top, 1 bottom) of the two-row header.
+static void composeHero(uint8_t part, uint16_t bg) {
+  const int16_t h = 2 * ROW_H, oy = -part * ROW_H;
+  const int16_t px = 10, py = oy + (h - HERO_PHOTO) / 2;
+  if (hero.photo) {
+    uint16_t *buf = canvas->getBuffer();
+    const int16_t cw = canvas->width(), ch = canvas->height();
+    for (int j = 0; j < HERO_PHOTO; j++) {
+      const int y = py + j;
+      if (y >= 0 && y < ch) memcpy(buf + y * cw + px, hero.photo + j * HERO_PHOTO, HERO_PHOTO * 2);
+    }
+  } else {
+    canvas->fillRect(px, py, HERO_PHOTO, HERO_PHOTO, pal.surface2);
+    uiDrawIcon(ICONS_24, hero.icon, px + 18, py + 18, hero.icon == ICON_STACK ? pal.accent : pal.faint);
+  }
+  roundCorners(px, py, HERO_PHOTO, hero.round ? (uiStyle.square ? 0 : HERO_PHOTO / 2) : uiRadiusCard(), bg);
+  const int16_t tx = px + HERO_PHOTO + 12, tw = LIST_W - tx - 8;
+  uiDrawText(FONT_HEADLINE, uiFitText(FONT_HEADLINE, hero.name, tw).c_str(), tx, oy + h / 2 + 2, pal.text);
+  uiDrawText(FONT_SMALL, uiFitText(FONT_SMALL, hero.sub, tw).c_str(), tx, oy + h / 2 + 18, pal.dim);
+}
+
+// Play all | Shuffle.
+#define ACTIONS_GAP 10
+static void composeActions(const Level &l) {
+  const int16_t h = 28, y = (ROW_H - h) / 2, w = (LIST_W - 2 * 10 - ACTIONS_GAP) / 2;
+  const struct {
+    uint16_t icon;
+    const char *label;
+    uint16_t fill, ink;
+  } buttons[2] = {{ICON_PLAY, l.kind == L_ARTIST_ALBUMS ? "Play all" : "Play", pal.accent, pal.onAccent},
+                  {ICON_SHUFFLE, "Shuffle", pal.surface2, pal.text}};
+  for (int b = 0; b < 2; b++) {
+    const int16_t x = 10 + b * (w + ACTIONS_GAP);
+    canvas->fillRect(x, y, w, h, buttons[b].fill);
+    roundRect(x, y, w, h, uiRadiusPill(h), pal.bg);
+    const int16_t tw = uiTextWidth(FONT_LABEL, buttons[b].label), cx = x + (w - 18 - 4 - tw) / 2;
+    uiDrawIcon(ICONS_18, buttons[b].icon, cx, y + 5, buttons[b].ink);
+    uiDrawText(FONT_LABEL, buttons[b].label, cx + 22, y + 18, buttons[b].ink);
+  }
+}
+
 // The thumbnail slot: a cover, a photo or a placeholder icon, 30 px at
 // (x, y), corners rounded per the Corners setting (artists: round).
 static void composeArt(const Row *row, int16_t x, int16_t y, bool atRest, uint16_t bg) {
@@ -755,6 +932,15 @@ static void composeRow(int32_t index, const Row *row, int16_t rowTop) {
   const uint16_t bg = playing ? pal.playing : pal.bg;
   canvas->fillRect(0, 0, LIST_W, h, bg);
   if (!row) {
+    return;
+  }
+  if (row->kind == R_HERO) {
+    loadHero(level());
+    composeHero(row->id, bg);
+    return;
+  }
+  if (row->kind == R_ACTIONS) {
+    composeActions(level());
     return;
   }
   const UiFont &body = uiFontBody(), &small = uiFontSmall();
@@ -892,6 +1078,7 @@ static void drawRows() {
 }
 
 static void drawList() {
+  if (!hasHero(level())) heroFree();
   drawRows();
   drawStrip();
 }
@@ -1154,7 +1341,10 @@ static void tickList() {
 
 static void tapRow(int r);
 
-static void listTouchDown(int16_t y) {
+static int16_t pressX = 0;
+
+static void listTouchDown(int16_t x, int16_t y) {
+  pressX = x;
   const bool moving = motion == M_FLING || motion == M_SNAP;
   caughtV = motion == M_FLING ? flingV : 0;
   if (!moving) {
@@ -1815,6 +2005,26 @@ static void tapSetting(uint32_t id) {
   uiShowPlayer();  // new colours or row heights: redraw everything
 }
 
+// Play all (in order) or Shuffle on an artist or album page.
+static void playAll(const Level &l, bool shuffle) {
+  PlayContext c;
+  ArtistRecord a;
+  if (l.kind == L_ARTIST_ALBUMS) {
+    if (!Catalog::artist(l.param, a)) return;
+    c = {CTX_ARTIST_IDX, a.firstSongPos, a.songCount};
+  } else {
+    c = levelContext(l);
+  }
+  if (!c.count) return;
+  shuffleOn = shuffle;
+  savePlayModes();
+  playCtx = c;
+  playFromTitle = l.title;
+  playIndex = shuffle ? esp_random() % c.count : 0;
+  reshuffle(playIndex, c.count);
+  startPlayback();
+}
+
 static void tapRow(int r) {
   const Level l = level();  // copy: pushLevel changes level()
   const int32_t index = l.top + r;
@@ -1829,6 +2039,7 @@ static void tapRow(int r) {
     case R_ALBUM: pushLevel(L_ALBUM_SONGS, row.id, row.line1); break;
     case R_FOLDER: pushLevel(L_FOLDER, row.id, row.line1); break;
     case R_SETTING: tapSetting(row.id); break;
+    case R_ACTIONS: playAll(l, pressX >= 10 + (LIST_W - 2 * 10 - ACTIONS_GAP) / 2 + ACTIONS_GAP / 2); break;
     default: break;
   }
 }
@@ -1920,7 +2131,7 @@ void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
   }
   // TOUCH_DOWN
   if (y >= LIST_Y && y < LIST_END && x < LIST_W) {
-    listTouchDown(y);  // a tap fires on release if the finger didn't move
+    listTouchDown(x, y);  // a tap fires on release if the finger didn't move
     return;
   }
   stopList();  // anything else first ends list movement
