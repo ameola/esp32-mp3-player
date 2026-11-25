@@ -19,6 +19,7 @@
 
 #include "ArtScan.h"
 #include "ArtFetch.h"
+#include "CardFile.h"
 #include "AudioPlayer.h"
 #include "Catalog.h"
 #include "Config.h"

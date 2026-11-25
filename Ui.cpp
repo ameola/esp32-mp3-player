@@ -15,6 +15,8 @@
 #include "UiTheme.h"
 #include "WifiSetup.h"
 #include <Preferences.h>
+#include <algorithm>
+#include <vector>
 #include <SD.h>
 #include <esp_heap_caps.h>
 #include "ThumbStore.h"
@@ -1807,6 +1809,244 @@ static void drawNowVolume() {
   lcdBlit(0, NP_VOL_Y, SCREEN_W, NP_VOL_H);
 }
 
+// ---------------------------------------------------------------- Lyrics
+// From an .lrc file next to the song ("Song.mp3" -> "Song.lrc"): timed
+// lines "[mm:ss.xx]text" (several stamps per line, [offset:ms] honoured),
+// or plain text, which scrolls with the song's progress. Lines are wrapped
+// to the screen once, when the song starts. Shown in Now Playing's upper
+// part instead of the cover; a tap on a timed line jumps there.
+#define LYRICS_MAX_FILE 12288
+#define LYRICS_MAX_LINES 400
+#define LYRIC_H 22
+#define LYRICS_Y NP_HEADER_H
+#define LYRICS_H (NP_BAR_Y - NP_HEADER_H)  // 173
+#define LYRICS_W (SCREEN_W - 32)
+struct LyricLine {
+  uint32_t ms;
+  uint16_t text;  // offset in lyricText
+};
+static char *lyricText = nullptr;
+static LyricLine *lyricLines = nullptr;
+static uint16_t lyricCount = 0;
+static bool lyricSynced = false;
+static uint32_t lyricSongId = LIB_NONE;
+static bool nowLyrics = false;  // Now Playing shows the lyrics
+static int lyricShown = -2, lyricFirst = 0;
+
+static void lyricsFree() {
+  free(lyricText);
+  free(lyricLines);
+  lyricText = nullptr;
+  lyricLines = nullptr;
+  lyricCount = 0;
+}
+
+static bool validUtf8(const char *s, size_t n) {
+  for (size_t i = 0; i < n;) {
+    const uint8_t c = s[i];
+    const int extra = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : -1;
+    if (extra < 0 || i + extra >= n + (extra ? 0 : 1)) return false;
+    for (int k = 1; k <= extra; k++) {
+      if ((static_cast<uint8_t>(s[i + k]) & 0xC0) != 0x80) return false;
+    }
+    i += 1 + extra;
+  }
+  return true;
+}
+
+// "mm:ss", "mm:ss.xx" or "mm:ss:xx" -> ms; false if not a time.
+static bool parseStamp(const char *s, size_t n, uint32_t &ms) {
+  uint32_t min = 0, sec = 0, frac = 0, fracDigits = 0;
+  size_t i = 0;
+  while (i < n && isdigit(static_cast<unsigned char>(s[i]))) min = min * 10 + (s[i++] - '0');
+  if (i == 0 || i >= n || s[i++] != ':') return false;
+  const size_t secStart = i;
+  while (i < n && isdigit(static_cast<unsigned char>(s[i]))) sec = sec * 10 + (s[i++] - '0');
+  if (i == secStart) return false;
+  if (i < n && (s[i] == '.' || s[i] == ':')) {
+    i++;
+    while (i < n && isdigit(static_cast<unsigned char>(s[i])) && fracDigits < 3) frac = frac * 10 + (s[i++] - '0'), fracDigits++;
+  }
+  if (i != n) return false;
+  while (fracDigits < 3) frac *= 10, fracDigits++;
+  ms = (min * 60 + sec) * 1000 + frac;
+  return true;
+}
+
+// Loads and wraps the playing song's lyrics (none: lyricCount 0).
+static void lyricsLoad() {
+  lyricsFree();
+  lyricSongId = current.id;
+  lyricShown = -2;
+  if (playIndex < 0) return;
+  const int dot = currentPath.lastIndexOf('.');
+  if (dot < 0) return;
+  FIL *fil = cardNewFil();
+  if (!fil) return;
+  bool open = false;
+  for (const char *ext : {".lrc", ".LRC"}) {
+    if (f_open(fil, cardPath(currentPath.substring(0, dot) + ext).c_str(), FA_READ) == FR_OK) {
+      open = true;
+      break;
+    }
+  }
+  if (!open) {
+    cardDeleteFil(fil);
+    return;
+  }
+  const UINT size = min<UINT>(f_size(fil), LYRICS_MAX_FILE);
+  char *raw = static_cast<char *>(malloc(size + 1));
+  UINT got = 0;
+  if (raw && f_read(fil, raw, size, &got) == FR_OK) raw[got] = 0;
+  else got = 0;
+  f_close(fil);
+  cardDeleteFil(fil);
+  if (!got) {
+    free(raw);
+    return;
+  }
+  // Text as UTF-8: Latin-1 files converted.
+  String text;
+  if (validUtf8(raw, got)) {
+    text = raw;
+  } else {
+    text.reserve(got + got / 8);
+    for (UINT i = 0; i < got; i++) {
+      const uint8_t c = raw[i];
+      if (c < 0x80) text += static_cast<char>(c);
+      else text += static_cast<char>(0xC0 | (c >> 6)), text += static_cast<char>(0x80 | (c & 0x3F));
+    }
+  }
+  free(raw);
+  if (text.startsWith("\xEF\xBB\xBF")) text.remove(0, 3);  // byte order mark
+
+  // Pass 1: entries (time, text) in file order.
+  struct Entry {
+    uint32_t ms;
+    String text;
+  };
+  std::vector<Entry> entries;
+  int32_t offsetMs = 0;
+  bool timed = false;
+  int start = 0;
+  while (start <= static_cast<int>(text.length()) && entries.size() < LYRICS_MAX_LINES) {
+    int end = text.indexOf('\n', start);
+    if (end < 0) end = text.length();
+    String line = text.substring(start, end);
+    start = end + 1;
+    line.trim();
+    std::vector<uint32_t> stamps;
+    bool tag = false;
+    while (line.startsWith("[")) {
+      const int close = line.indexOf(']');
+      if (close < 0) break;
+      const String inside = line.substring(1, close);
+      uint32_t ms;
+      if (parseStamp(inside.c_str(), inside.length(), ms)) {
+        stamps.push_back(ms);
+      } else {
+        if (inside.startsWith("offset:")) offsetMs = inside.substring(7).toInt();
+        tag = true;
+      }
+      line = line.substring(close + 1);
+      line.trim();
+    }
+    if (!stamps.empty()) {
+      timed = true;
+      for (uint32_t ms : stamps) entries.push_back({ms, line});
+    } else if (!tag && line.length()) {
+      entries.push_back({0, line});
+    }
+  }
+  if (entries.empty()) return;
+  lyricSynced = timed;
+  if (timed) {  // stamps can appear in any order (a chorus listed once with several stamps)
+    std::stable_sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) { return a.ms < b.ms; });
+    for (Entry &e : entries) e.ms = static_cast<uint32_t>(max<int32_t>(0, static_cast<int32_t>(e.ms) - offsetMs));
+  }
+  // Pass 2: wrap to the screen into one buffer.
+  String wrapped;
+  std::vector<LyricLine> lines;
+  for (const Entry &e : entries) {
+    String rest = e.text;
+    do {
+      size_t cut = rest.length();
+      while (cut > 0 && uiTextWidth(FONT_BODY, rest.substring(0, cut).c_str()) > LYRICS_W) {
+        const int space = rest.lastIndexOf(' ', cut - 1);
+        cut = space > 0 ? space : cut - 1;
+      }
+      if (cut == 0) cut = rest.length();
+      lines.push_back({e.ms, static_cast<uint16_t>(wrapped.length())});
+      wrapped += rest.substring(0, cut);
+      wrapped += '\0';
+      rest = rest.substring(cut);
+      rest.trim();
+    } while (rest.length() && lines.size() < LYRICS_MAX_LINES);
+    if (lines.size() >= LYRICS_MAX_LINES) break;
+  }
+  lyricText = static_cast<char *>(malloc(wrapped.length() + 1));
+  lyricLines = static_cast<LyricLine *>(malloc(lines.size() * sizeof(LyricLine)));
+  if (!lyricText || !lyricLines) {
+    lyricsFree();
+    return;
+  }
+  memcpy(lyricText, wrapped.c_str(), wrapped.length() + 1);
+  for (size_t i = 0; i < wrapped.length(); i++) {
+    if (wrapped[i] == 0) lyricText[i] = 0;  // String keeps the embedded NULs
+  }
+  memcpy(lyricLines, lines.data(), lines.size() * sizeof(LyricLine));
+  lyricCount = lines.size();
+  Serial.printf("[lyrics] %u lines (%s), %u bytes\n", lyricCount, lyricSynced ? "timed" : "plain", wrapped.length());
+}
+
+// The line playing now.
+static int currentLyric() {
+  if (!lyricCount) return -1;
+  const uint32_t at = elapsedMs();
+  if (!lyricSynced) {
+    return current.durationMs ? min<int>(lyricCount - 1, static_cast<uint64_t>(at) * lyricCount / current.durationMs) : 0;
+  }
+  int cur = -1;
+  for (int i = 0; i < lyricCount && lyricLines[i].ms <= at; i++) cur = i;
+  return cur;
+}
+
+static void drawLyrics(bool force) {
+  const int cur = currentLyric();
+  if (!force && cur == lyricShown) return;
+  lyricShown = cur;
+  const int perScreen = LYRICS_H / LYRIC_H;  // 7
+  lyricFirst = max(0, cur - perScreen / 2 + 1);
+  for (int16_t band = 0; band < LYRICS_H; band += 2 * LYRIC_H) {
+    const int16_t h = min<int16_t>(2 * LYRIC_H, LYRICS_H - band);
+    canvas->fillRect(0, 0, SCREEN_W, h, pal.bg);
+    if (!lyricCount) {
+      if (band == 2 * LYRIC_H) {
+        drawCentered(FONT_BODY, "No lyrics for this song", SCREEN_W / 2, 16, pal.dim);
+        drawCentered(FONT_SMALL, "An .lrc file next to the MP3 shows here", SCREEN_W / 2, 34, pal.faint);
+      }
+    } else {
+      for (int k = 0; k < 2; k++) {
+        const int i = lyricFirst + band / LYRIC_H + k;
+        if (i >= lyricCount) break;
+        const uint16_t color = i == cur ? pal.accent : i < cur ? pal.faint : pal.dim;
+        uiDrawText(FONT_BODY, lyricText + lyricLines[i].text, 16, k * LYRIC_H + 16, color);
+      }
+    }
+    lcdBlit(0, LYRICS_Y + band, SCREEN_W, h);
+  }
+}
+
+// Jumps to ms in the playing song (byte position estimated from the length).
+static void seekTo(uint32_t ms) {
+  if (playIndex < 0 || !current.durationMs || current.audioEnd <= current.audioStart) return;
+  ms = min(ms, current.durationMs - 1000);
+  const uint32_t pos = current.audioStart +
+                       static_cast<uint64_t>(current.audioEnd - current.audioStart) * ms / current.durationMs;
+  audioPlay(currentPath.c_str(), pos);
+  lyricShown = -2;
+}
+
 static void drawNow() {
   NowDraw unmute;
   nowSongId = current.id;
@@ -1816,7 +2056,17 @@ static void drawNow() {
   uiDrawIcon(ICONS_24, ICON_EXPAND, 6, 3, pal.text);
   drawCentered(FONT_TAB, "Playing from", SCREEN_W / 2, 12, pal.dim);
   drawCentered(FONT_LABEL, uiFitText(FONT_LABEL, playFromTitle, SCREEN_W - 96), SCREEN_W / 2, 25, pal.text);
+  if (lyricSongId != current.id) lyricsLoad();
+  uiDrawIcon(ICONS_24, ICON_LYRICS, SCREEN_W - 30, 3, nowLyrics ? pal.accent : lyricCount ? pal.text : pal.faint);
   lcdBlit(0, 0, SCREEN_W, NP_HEADER_H);
+  if (nowLyrics) {
+    titleMarquee.active = false;
+    drawLyrics(true);
+    drawNowBar();
+    drawNowControls();
+    drawNowVolume();
+    return;
+  }
   // Cover.
   lcdFillRect(0, NP_HEADER_H, SCREEN_W, NP_TEXT_Y - NP_HEADER_H, pal.bg);
   const int16_t coverX = (SCREEN_W - NP_COVER) / 2;
@@ -2202,7 +2452,25 @@ static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
     return;
   }
   if (y < NP_HEADER_H + 6) {
-    if (x < 48) closeNow();
+    if (x < 48) {
+      closeNow();
+    } else if (x >= SCREEN_W - 48) {
+      nowLyrics = !nowLyrics;
+      drawNow();
+    }
+  } else if (y >= NP_BAR_Y && y < NP_BAR_Y + NP_BAR_H) {  // seek bar
+    if (current.durationMs) {
+      seekTo(static_cast<uint64_t>(constrain(x - NP_BAR_X, 0, NP_BAR_W)) * current.durationMs / NP_BAR_W);
+      NowDraw unmute;
+      drawNowBar();
+    }
+  } else if (nowLyrics && y < NP_BAR_Y && lyricSynced) {  // a lyric line
+    const int i = lyricFirst + (y - LYRICS_Y) / LYRIC_H;
+    if (i >= 0 && i < lyricCount) {
+      seekTo(lyricLines[i].ms);
+      NowDraw unmute;
+      drawLyrics(true);
+    }
   } else if (y >= NP_CTRL_Y && y < NP_CTRL_Y + NP_CTRL_H) {
     if (x < 40) toggleShuffle();
     else if (x < 92) previousTrack();
@@ -2374,6 +2642,9 @@ void uiTick() {
   if (nowOpen) {
     NowDraw unmute;
     marqueeTick(titleMarquee);
+  } else if (lyricCount && current.id != lyricSongId) {
+    lyricsFree();  // another song: load its lyrics when Now Playing opens
+    lyricSongId = LIB_NONE;
   }
 
   static uint32_t lastSlow = 0;
@@ -2382,6 +2653,7 @@ void uiTick() {
     if (audioState() == PLAYING) {
       if (nowOpen) {
         NowDraw unmute;
+        if (nowLyrics) drawLyrics(false);
         drawNowBar();
       } else {
         drawMiniProgress(false);
