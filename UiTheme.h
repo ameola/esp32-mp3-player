@@ -30,6 +30,7 @@ struct UiStyle {
   bool square = false;   // corners: Round / Square
   uint8_t brightness = 3;  // 0..3: Low, Medium, High, Max
   uint8_t sleep = 4;       // screen off after: 30 s, 1 min, 5 min, 15 min, Never
+  bool lyrics = true;      // swipe Now Playing's cover for .lrc lyrics
 };
 
 extern UiPalette pal;  // the current theme's colours

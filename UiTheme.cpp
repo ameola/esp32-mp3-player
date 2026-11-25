@@ -58,6 +58,7 @@ void uiStyleLoad() {
     uiStyle.square = p.getBool("square", false);
     uiStyle.brightness = min<uint8_t>(p.getUChar("bright", 3), 3);
     uiStyle.sleep = min<uint8_t>(p.getUChar("sleep", 4), 4);
+    uiStyle.lyrics = p.getBool("lyrics", true);
     p.end();
   }
   apply();
@@ -76,6 +77,7 @@ void uiStyleSet(const UiStyle &style) {
     p.putBool("square", uiStyle.square);
     p.putUChar("bright", uiStyle.brightness);
     p.putUChar("sleep", uiStyle.sleep);
+    p.putBool("lyrics", uiStyle.lyrics);
     p.end();
   }
 }

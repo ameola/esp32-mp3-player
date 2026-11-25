@@ -248,7 +248,7 @@ static void handleTouch(TouchPhase phase, int16_t x, int16_t y) {
   }
 }
 
-// Debug aid: inject touches over Serial: "tap x y", "drag x y1 y2 [ms]",
+// Debug aid: inject touches over Serial: "tap x y", "drag x y1 y2 [ms]", "swipe y x1 x2",
 // "audiocpu" (time spent decoding over 3 s), "artscan" (album art survey),
 // "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "libdump" (every song's cleaned tags and path), "uistyle" (set or reset the UI style),
 // "mem" (free memory after each startup step, and now),
@@ -293,6 +293,12 @@ static void serviceSerialCommands() {
         }
       }
       handleTouch(TOUCH_UP, x, a);
+    } else if (sscanf(line.c_str(), "swipe %d %d %d", &y, &x, &a) == 3) {  // sideways: y, x from, x to
+      handleTouch(TOUCH_DOWN, x, y);
+      for (int step = 1; step <= 8; step++) {
+        handleTouch(TOUCH_MOVE, x + (a - x) * step / 8, y);
+      }
+      handleTouch(TOUCH_UP, a, y);
     } else if (sscanf(line.c_str(), "hold %d %d %d", &x, &y, &a) == 3) {
       handleTouch(TOUCH_DOWN, x, y);
       while (millis() - t0 < static_cast<uint32_t>(a)) {

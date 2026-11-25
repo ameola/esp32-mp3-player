@@ -36,14 +36,17 @@ enum ListKind : uint8_t {
   L_SETTINGS,       // the Settings tab: its groups
   L_SETTINGS_GROUP, // param: SettingGroup. Its settings
   L_SETTING_CHOICE, // param: SettingId. Its choices
-  L_SEARCH,         // search results (searchHits)
+  L_SEARCH,         // search results: a few of each category
+  L_SEARCH_LIST,    // param: SearchCategory. All hits of one category
 };
 
 enum RowKind : uint8_t { R_NONE, R_SONG, R_ARTIST, R_ALBUM, R_ALL_SONGS, R_FOLDER, R_SETTING,
                          R_HERO,      // page header (id: 0 top half, 1 bottom half)
                          R_ACTIONS,   // Play all / Shuffle
                          R_GROUP,     // Settings group (id: SettingGroup)
-                         R_CHOICE };  // one choice of a setting (id: its index)
+                         R_CHOICE,    // one choice of a setting (id: its index)
+                         R_SECTION,   // search results: a category's heading (id: category)
+                         R_MORE };    // search results: "See all" (id: category)
 
 struct Level {
   ListKind kind = L_SONGS;
@@ -114,13 +117,17 @@ static int32_t playIndex = -1;  // index of the playing song in playCtx
 static Track current;           // the playing song
 static String currentPath;
 
-// The last search's results: artists, then albums, then songs.
-struct SearchHit {
-  uint8_t kind;  // R_ARTIST, R_ALBUM, R_SONG
-  uint32_t id;
+// The last search's results by category, and the results page: each
+// category's heading, its first few hits, "See all" if there are more.
+enum SearchCategory : uint8_t { SC_ARTISTS, SC_ALBUMS, SC_SONGS, SC_COUNT };
+static std::vector<uint32_t> searchIds[SC_COUNT];  // artist ids, album ids, song ids
+struct SearchEntry {
+  uint8_t type;  // 0 heading, 1 hit, 2 "See all"
+  uint8_t cat;
+  uint16_t idx;  // hit: index in searchIds[cat]
 };
-static std::vector<SearchHit> searchHits;
-static uint32_t searchSongStart = 0;  // index of the first song hit
+static std::vector<SearchEntry> searchPage;
+static String searchShown;  // the query the results are for
 
 static bool ctxSong(const PlayContext &c, uint32_t i, uint32_t &id) {
   if (i >= c.count) {
@@ -132,8 +139,8 @@ static bool ctxSong(const PlayContext &c, uint32_t i, uint32_t &id) {
     case CTX_SONG_IDS: id = c.start + i; return true;
     case CTX_NONE_IDX: return Catalog::noneSong(c.start + i, id);
     case CTX_SEARCH:
-      if (c.start + i >= searchHits.size()) return false;
-      id = searchHits[c.start + i].id;
+      if (c.start + i >= searchIds[SC_SONGS].size()) return false;
+      id = searchIds[SC_SONGS][c.start + i];
       return true;
     default: return false;
   }
@@ -226,7 +233,7 @@ static bool isPlaying(uint32_t songId) {
 // setting with choices opens a list of them (the current one ticked), an
 // action runs on a tap, and an information row shows a value.
 enum SettingId : uint8_t {
-  S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP,  // Display
+  S_THEME, S_DENSITY, S_TEXT, S_CORNERS, S_BRIGHTNESS, S_SLEEP, S_LYRICS,  // Display
   S_WIFI, S_ART, S_ART_NOW,                                       // WiFi & album art
   S_SONGS, S_ARTISTS, S_ALBUMS, S_REBUILD,                        // Library
   S_VERSION, S_BOARD, S_MEMORY, S_CARD, S_UPTIME,                 // System
@@ -251,7 +258,7 @@ static String formatCount(uint32_t n) {
 static uint8_t choiceCount(uint32_t id) {
   switch (id) {
     case S_THEME: return THEME_COUNT;
-    case S_DENSITY: case S_TEXT: case S_CORNERS: case S_ART: return 2;
+    case S_DENSITY: case S_TEXT: case S_CORNERS: case S_ART: case S_LYRICS: return 2;
     case S_BRIGHTNESS: return 4;
     case S_SLEEP: return 5;
     default: return 0;
@@ -267,6 +274,7 @@ static String choiceName(uint32_t id, uint8_t i) {
     case S_BRIGHTNESS: return uiBrightnessName(i);
     case S_SLEEP: return i == 4 ? String("Never") : String(uiSleepName(i)) + " without a touch";
     case S_ART: return i ? "On, while nothing plays" : "Off";
+    case S_LYRICS: return i ? "Swipe the cover to show" : "Off";
     default: return "";
   }
 }
@@ -279,6 +287,7 @@ static uint8_t choiceCurrent(uint32_t id) {
     case S_CORNERS: return uiStyle.square;
     case S_BRIGHTNESS: return uiStyle.brightness;
     case S_SLEEP: return uiStyle.sleep;
+    case S_LYRICS: return uiStyle.lyrics;
     case S_ART: return artFetchEnabled();
     default: return 0;
   }
@@ -286,7 +295,7 @@ static uint8_t choiceCurrent(uint32_t id) {
 
 static const char *settingLabel(uint32_t id) {
   static const char *const labels[SETTING_COUNT] = {
-    "Theme", "Density", "Text size", "Corners", "Brightness", "Screen off after",
+    "Theme", "Density", "Text size", "Corners", "Brightness", "Screen off after", "Lyrics",
     "WiFi network", "Album art downloads", "Download now",
     "Songs", "Artists", "Albums", "Rebuild library",
     "Version", "Board", "Free memory", "SD card", "Running for"};
@@ -295,7 +304,7 @@ static const char *settingLabel(uint32_t id) {
 
 static uint16_t settingIcon(uint32_t id) {
   static const uint16_t icons[SETTING_COUNT] = {
-    ICON_PALETTE, ICON_DENSITY, ICON_TEXT_SIZE, ICON_CORNER, ICON_BRIGHTNESS, ICON_BEDTIME,
+    ICON_PALETTE, ICON_DENSITY, ICON_TEXT_SIZE, ICON_CORNER, ICON_BRIGHTNESS, ICON_BEDTIME, ICON_LYRICS,
     ICON_WIFI, ICON_IMAGE, ICON_DOWNLOAD,
     ICON_MUSIC_NOTE, ICON_PERSON, ICON_ALBUM, ICON_REFRESH,
     ICON_INFO, ICON_MEMORY, ICON_MEMORY, ICON_FOLDER, ICON_INFO};
@@ -398,7 +407,8 @@ static PlayContext levelContext(const Level &l) {
       if (Catalog::folder(l.param, f)) c = {CTX_SONG_IDS, f.firstSong, f.songCount};
       break;
     case L_SEARCH:
-      c = {CTX_SEARCH, searchSongStart, static_cast<uint32_t>(searchHits.size()) - searchSongStart};
+    case L_SEARCH_LIST:  // songs play through all the song hits
+      c = {CTX_SEARCH, 0, static_cast<uint32_t>(searchIds[SC_SONGS].size())};
       break;
     default:
       break;
@@ -417,7 +427,6 @@ static bool hasHero(const Level &l) {
 static uint32_t songRowOffset(const Level &l) {
   FolderRecord f;
   if (l.kind == L_ALBUM_SONGS) return HERO_ROWS;
-  if (l.kind == L_SEARCH) return searchSongStart;
   return (l.kind == L_FOLDER && Catalog::folder(l.param, f)) ? f.childCount : 0;
 }
 
@@ -436,7 +445,8 @@ static int32_t levelCount(const Level &l) {
     case L_SETTINGS:
     case L_SETTINGS_GROUP:
     case L_SETTING_CHOICE: return settingsCount(l);
-    case L_SEARCH: return searchHits.size();
+    case L_SEARCH: return searchPage.size();
+    case L_SEARCH_LIST: return l.param < SC_COUNT ? searchIds[l.param].size() : 0;
   }
   return 0;
 }
@@ -488,6 +498,30 @@ static bool songRow(uint32_t id, bool showTrackNumbers, Row &row) {
     row.art = artAlbumKey(artist.length() ? artist.c_str() : "Unknown Artist", album.c_str());
     if (t.albumArtist.isEmpty()) row.art2 = artAlbumKey("Various Artists", album.c_str());
   }
+  return true;
+}
+
+static bool levelRow(const Level &l, uint32_t i, Row &row);
+
+// One search hit as a row.
+static bool searchItemRow(uint32_t cat, uint32_t idx, Row &row) {
+  if (cat >= SC_COUNT || idx >= searchIds[cat].size()) return false;
+  const uint32_t id = searchIds[cat][idx];
+  if (cat == SC_SONGS) return songRow(id, false, row);
+  if (cat == SC_ARTISTS) {
+    Level artists;
+    artists.kind = L_ARTISTS;
+    return levelRow(artists, id, row);
+  }
+  AlbumRecord al;
+  ArtistRecord a;
+  if (!Catalog::album(id, al)) return false;
+  row.kind = R_ALBUM;
+  row.id = id;
+  row.line1 = al.name;
+  row.line2 = Catalog::artist(al.artistId, a) ? String(a.name) : String("");
+  row.art = artAlbumKey(row.line2.c_str(), al.name);
+  if (al.year) row.line2 += ", " + String(al.year);
   return true;
 }
 
@@ -562,23 +596,28 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
     case L_SETTING_CHOICE:
       return settingsRow(l, i, row);
     case L_SEARCH: {
-      if (i >= searchHits.size()) return false;
-      const SearchHit &h = searchHits[i];
-      if (h.kind == R_SONG) return songRow(h.id, false, row);
-      if (h.kind == R_ARTIST) {
-        Level artists;
-        artists.kind = L_ARTISTS;
-        return levelRow(artists, h.id, row);
+      if (i >= searchPage.size()) return false;
+      const SearchEntry &e = searchPage[i];
+      static const char *const names[SC_COUNT] = {"Artists", "Albums", "Songs"};
+      if (e.type == 0) {
+        row.kind = R_SECTION;
+        row.id = e.cat;
+        row.line1 = names[e.cat];
+        row.right = formatCount(searchIds[e.cat].size());
+        return true;
       }
-      if (!Catalog::album(h.id, al)) return false;  // R_ALBUM
-      row.kind = R_ALBUM;
-      row.id = h.id;
-      row.line1 = al.name;
-      row.line2 = Catalog::artist(al.artistId, a) ? String(a.name) : String("");
-      row.art = artAlbumKey(row.line2.c_str(), al.name);
-      if (al.year) row.line2 += ", " + String(al.year);
-      return true;
+      if (e.type == 2) {
+        row.kind = R_MORE;
+        row.id = e.cat;
+        String what = names[e.cat];
+        what.toLowerCase();
+        row.line1 = "See all " + formatCount(searchIds[e.cat].size()) + " " + what;
+        return true;
+      }
+      return searchItemRow(e.cat, e.idx, row);
     }
+    case L_SEARCH_LIST:
+      return searchItemRow(l.param, i, row);
     default: {  // song lists
       uint32_t songId;
       // Track numbers in an album, not in a "none" album (by title).
@@ -1094,6 +1133,19 @@ static void composeRow(int32_t index, const Row *row, int16_t rowTop) {
   }
   if (row->kind == R_ACTIONS) {
     composeActions(level());
+    return;
+  }
+  if (row->kind == R_SECTION) {  // a category heading, set low over its rows
+    String label = row->line1;
+    label.toUpperCase();
+    uiDrawText(FONT_LABEL, label.c_str(), 12, h - 10, pal.dim);
+    uiDrawText(FONT_LABEL, row->right.c_str(), 16 + uiTextWidth(FONT_LABEL, label.c_str()), h - 10, pal.faint);
+    canvas->drawFastHLine(12, h - 4, LIST_W - 24, pal.line);
+    return;
+  }
+  if (row->kind == R_MORE) {
+    uiDrawText(FONT_BODY, row->line1.c_str(), 12, h / 2 + 5, pal.accent);
+    uiDrawIcon(ICONS_14, ICON_CHEVRON, LIST_W - 18, (h - 14) / 2, pal.accent);
     return;
   }
   const UiFont &body = uiFontBody(), &small = uiFontSmall();
@@ -1757,9 +1809,10 @@ static String playFromTitle;  // the list playback started from
 
 #define NP_HEADER_H 30
 #define NP_COVER 125  // a 250 px cover at 1/2
-#define NP_COVER_Y 34
-#define NP_TEXT_Y 163
-#define NP_TEXT_H 40
+#define NP_COVER_Y 31
+#define NP_DOTS_Y 159  // page dots: cover / lyrics
+#define NP_TEXT_Y 165
+#define NP_TEXT_H 38
 #define NP_BAR_Y 203
 #define NP_BAR_H 28
 #define NP_BAR_X 16
@@ -1864,7 +1917,8 @@ static void drawNowVolume() {
 #define LYRICS_MAX_LINES 400
 #define LYRIC_H 22
 #define LYRICS_Y NP_HEADER_H
-#define LYRICS_H (NP_BAR_Y - NP_HEADER_H)  // 173
+#define LYRICS_H 158                       // 7 lines; the dots below
+#define NP_LYRIC_DOTS_Y (LYRICS_Y + LYRICS_H + 2)
 #define LYRICS_W (SCREEN_W - 32)
 struct LyricLine {
   uint32_t ms;
@@ -2092,6 +2146,34 @@ static void seekTo(uint32_t ms) {
   lyricShown = -2;
 }
 
+// Two dots for the two pages (cover, lyrics), shown when the song has lyrics.
+static void drawNowDots(int16_t y) {
+  canvas->fillRect(0, 0, SCREEN_W, 8, pal.bg);
+  if (uiStyle.lyrics && lyricCount) {
+    drawDot(SCREEN_W / 2 - 6, 4, 3, nowLyrics ? pal.faint : pal.accent, pal.bg);
+    drawDot(SCREEN_W / 2 + 6, 4, 3, nowLyrics ? pal.accent : pal.faint, pal.bg);
+  }
+  lcdBlit(0, y, SCREEN_W, 8);
+}
+
+// "Swipe the cover for lyrics" in the top bar, the first few times.
+static uint8_t lyricHintsShown = 0xFF;
+static bool takeLyricHint() {
+  if (lyricHintsShown == 0xFF) {
+    Preferences p;
+    lyricHintsShown = p.begin("ui", true) ? p.getUChar("lyrHint", 0) : 0;
+    p.end();
+  }
+  if (lyricHintsShown >= 3) return false;
+  lyricHintsShown++;
+  Preferences p;
+  if (p.begin("ui", false)) {
+    p.putUChar("lyrHint", lyricHintsShown);
+    p.end();
+  }
+  return true;
+}
+
 static void drawNow() {
   NowDraw unmute;
   nowSongId = current.id;
@@ -2099,14 +2181,28 @@ static void drawNow() {
   // Header: collapse, where playback came from.
   canvas->fillRect(0, 0, SCREEN_W, NP_HEADER_H, pal.bg);
   uiDrawIcon(ICONS_24, ICON_EXPAND, 6, 3, pal.text);
-  drawCentered(FONT_TAB, "Playing from", SCREEN_W / 2, 12, pal.dim);
-  drawCentered(FONT_LABEL, uiFitText(FONT_LABEL, playFromTitle, SCREEN_W - 96), SCREEN_W / 2, 25, pal.text);
-  if (lyricSongId != current.id) lyricsLoad();
-  uiDrawIcon(ICONS_24, ICON_LYRICS, SCREEN_W - 30, 3, nowLyrics ? pal.accent : lyricCount ? pal.text : pal.faint);
+  const bool newSong = lyricSongId != current.id;
+  if (newSong) {
+    if (uiStyle.lyrics) {
+      lyricsLoad();
+    } else {
+      lyricsFree();
+      lyricSongId = current.id;
+    }
+  }
+  if (!lyricCount) nowLyrics = false;
+  if (lyricCount && !nowLyrics && newSong && takeLyricHint()) {
+    drawCentered(FONT_LABEL, "Swipe the cover for lyrics", SCREEN_W / 2, 19, pal.accent);
+  } else {
+    drawCentered(FONT_TAB, "Playing from", SCREEN_W / 2, 12, pal.dim);
+    drawCentered(FONT_LABEL, uiFitText(FONT_LABEL, playFromTitle, SCREEN_W - 96), SCREEN_W / 2, 25, pal.text);
+  }
   lcdBlit(0, 0, SCREEN_W, NP_HEADER_H);
   if (nowLyrics) {
     titleMarquee.active = false;
     drawLyrics(true);
+    lcdFillRect(0, LYRICS_Y + LYRICS_H, SCREEN_W, NP_BAR_Y - LYRICS_Y - LYRICS_H, pal.bg);
+    drawNowDots(NP_LYRIC_DOTS_Y);
     drawNowBar();
     drawNowControls();
     drawNowVolume();
@@ -2124,6 +2220,7 @@ static void drawNow() {
     uiDrawIcon(ICONS_24, ICON_MUSIC_NOTE, (NP_COVER - 24) / 2, 0, pal.faint);
     lcdBlit(coverX, NP_COVER_Y + (NP_COVER - 24) / 2, NP_COVER, 24);
   }
+  drawNowDots(NP_DOTS_Y);
   drawNowText();
   drawNowBar();
   drawNowControls();
@@ -2380,6 +2477,7 @@ static void pickChoice(uint32_t id, uint8_t i) {
     case S_CORNERS: style.square = i; break;
     case S_BRIGHTNESS: style.brightness = i; break;
     case S_SLEEP: style.sleep = i; break;
+    case S_LYRICS: style.lyrics = i; break;
     case S_ART: {
       CardSettings cs;
       cardSettingsLoad(cs);
@@ -2396,7 +2494,8 @@ static void pickChoice(uint32_t id, uint8_t i) {
   }
   uiStyleSet(style);
   logSetting(id);
-  if (id == S_BRIGHTNESS || id == S_SLEEP) {
+  if (id == S_BRIGHTNESS || id == S_SLEEP || id == S_LYRICS) {
+    if (id == S_LYRICS && !style.lyrics) nowLyrics = false;
     drawRows();
     return;
   }
@@ -2458,6 +2557,18 @@ static void tapRow(int r) {
   Row row;
   if (index >= levelCount(l) || !levelRow(l, index, row)) {
     return;
+  }
+  if (l.kind == L_SEARCH) {  // the results page: song hits by their place among all song hits
+    const SearchEntry &e = searchPage[index];
+    if (row.kind == R_MORE) {
+      static const char *const names[SC_COUNT] = {"Artists", "Albums", "Songs"};
+      pushLevel(L_SEARCH_LIST, e.cat, String(names[e.cat]) + " \xE2\x80\x9C" + searchShown + "\xE2\x80\x9D");
+      return;
+    }
+    if (row.kind == R_SONG) {
+      playFromLevel(l, e.idx);
+      return;
+    }
   }
   switch (row.kind) {
     case R_SONG: playFromLevel(l, index - songRowOffset(l)); break;
@@ -2565,24 +2676,23 @@ static bool containsNoCase(const char *hay, const String &needle) {
   return false;
 }
 
-// Runs the search; true if anything was found (searchHits filled).
+// Runs the search; true if anything was found (searchIds, searchPage).
 static bool runSearch(const String &q) {
-  searchHits.clear();
-  searchSongStart = 0;
+  for (auto &v : searchIds) v.clear();
+  searchPage.clear();
   const uint32_t t0 = millis();
   ArtistRecord a;
-  for (uint32_t i = 0; i < Catalog::artistCount() && searchHits.size() < SEARCH_MAX_HITS; i++) {
-    if (Catalog::artist(i, a) && containsNoCase(a.name, q)) searchHits.push_back({R_ARTIST, i});
+  for (uint32_t i = 0; i < Catalog::artistCount() && searchIds[SC_ARTISTS].size() < SEARCH_MAX_HITS; i++) {
+    if (Catalog::artist(i, a) && containsNoCase(a.name, q)) searchIds[SC_ARTISTS].push_back(i);
   }
   AlbumRecord al;
   uint32_t id;
-  for (uint32_t p = 0; p < Catalog::albumIndexCount() && searchHits.size() < SEARCH_MAX_HITS; p++) {
+  for (uint32_t p = 0; p < Catalog::albumIndexCount() && searchIds[SC_ALBUMS].size() < SEARCH_MAX_HITS; p++) {
     if (Catalog::albumByName(p, id) && Catalog::album(id, al) && !(al.flags & ALBUM_NONE_ALL) &&
         containsNoCase(al.name, q)) {
-      searchHits.push_back({R_ALBUM, id});
+      searchIds[SC_ALBUMS].push_back(id);
     }
   }
-  searchSongStart = searchHits.size();
   // Songs: one pass over songs.dat. Copies of a song (hidden from the lists)
   // are told apart only by their folder, so equal title + artist is shown once.
   struct Found {
@@ -2594,7 +2704,7 @@ static bool runSearch(const String &q) {
   if (songs.open(Catalog::generation(), LF_SONGS, sizeof(SongRecord))) {
     songs.setReadAhead(8192);
     SongRecord r;
-    for (uint32_t i = 0; i < songs.count() && searchHits.size() + found.size() < SEARCH_MAX_HITS; i++) {
+    for (uint32_t i = 0; i < songs.count() && found.size() < SEARCH_MAX_HITS; i++) {
       if (!songs.read(i, &r)) break;
       if (!containsNoCase(r.title, q) && !containsNoCase(r.artist, q) && !containsNoCase(r.album, q)) continue;
       String key = String(r.title) + "\x1f" + r.artist;
@@ -2608,10 +2718,19 @@ static bool runSearch(const String &q) {
   }
   std::sort(found.begin(), found.end(),
             [](const Found &x, const Found &y) { return strcasecmp(x.title.c_str(), y.title.c_str()) < 0; });
-  for (const Found &f : found) searchHits.push_back({R_SONG, f.id});
-  Serial.printf("[search] \"%s\": %u artists and albums, %u songs in %lu ms\n", q.c_str(), searchSongStart,
-                found.size(), millis() - t0);
-  return !searchHits.empty();
+  for (const Found &f : found) searchIds[SC_SONGS].push_back(f.id);
+  // The results page: heading, a few hits, "See all" when there are more.
+  static const uint8_t preview[SC_COUNT] = {3, 3, 5};
+  for (uint8_t c = 0; c < SC_COUNT; c++) {
+    const size_t n = searchIds[c].size();
+    if (!n) continue;
+    searchPage.push_back({0, c, 0});
+    for (size_t i = 0; i < n && i < preview[c]; i++) searchPage.push_back({1, c, static_cast<uint16_t>(i)});
+    if (n > preview[c]) searchPage.push_back({2, c, 0});
+  }
+  Serial.printf("[search] \"%s\": %u artists, %u albums, %u songs in %lu ms\n", q.c_str(), searchIds[SC_ARTISTS].size(),
+                searchIds[SC_ALBUMS].size(), searchIds[SC_SONGS].size(), millis() - t0);
+  return !searchPage.empty();
 }
 
 static void searchTouch(TouchPhase phase, int16_t x, int16_t y) {
@@ -2644,6 +2763,7 @@ static void searchTouch(TouchPhase phase, int16_t x, int16_t y) {
         break;
       }
       drawSearchHint("Searching...", q);
+      searchShown = q;
       if (!runSearch(foldAscii(q.c_str()))) {
         drawSearchHint("Nothing found", q);
         break;
@@ -2664,35 +2784,48 @@ static void searchTouch(TouchPhase phase, int16_t x, int16_t y) {
   }
 }
 
+static int16_t swipeX0 = 0, swipeY0 = 0;
+static bool inPages = false;  // a touch that began on the cover / lyrics
+
 static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
   if (phase == TOUCH_UP) {
     volumeDrag = false;
+    if (inPages) {  // no swipe: a tap
+      inPages = false;
+      if (nowLyrics && lyricSynced && swipeY0 < LYRICS_Y + LYRICS_H) {
+        const int i = lyricFirst + (swipeY0 - LYRICS_Y) / LYRIC_H;
+        if (i >= 0 && i < lyricCount) {
+          seekTo(lyricLines[i].ms);
+          NowDraw unmute;
+          drawLyrics(true);
+        }
+      }
+    }
     return;
   }
   if (phase == TOUCH_MOVE) {
     if (volumeDrag) setVolumeAt(x);
+    if (inPages && abs(x - swipeX0) > 36 && abs(x - swipeX0) > 2 * abs(y - swipeY0)) {
+      inPages = false;  // one page turn per swipe
+      const bool lyrics = x < swipeX0;  // left: lyrics; right: the cover
+      if (lyrics != nowLyrics && (!lyrics || (uiStyle.lyrics && lyricCount))) {
+        nowLyrics = lyrics;
+        drawNow();
+      }
+    }
     return;
   }
   if (y < NP_HEADER_H + 6) {
-    if (x < 48) {
-      closeNow();
-    } else if (x >= SCREEN_W - 48) {
-      nowLyrics = !nowLyrics;
-      drawNow();
-    }
-  } else if (y >= NP_BAR_Y && y < NP_BAR_Y + NP_BAR_H) {  // seek bar
+    if (x < 48) closeNow();  } else if (y >= NP_BAR_Y && y < NP_BAR_Y + NP_BAR_H) {  // seek bar
     if (current.durationMs) {
       seekTo(static_cast<uint64_t>(constrain(x - NP_BAR_X, 0, NP_BAR_W)) * current.durationMs / NP_BAR_W);
       NowDraw unmute;
       drawNowBar();
     }
-  } else if (nowLyrics && y < NP_BAR_Y && lyricSynced) {  // a lyric line
-    const int i = lyricFirst + (y - LYRICS_Y) / LYRIC_H;
-    if (i >= 0 && i < lyricCount) {
-      seekTo(lyricLines[i].ms);
-      NowDraw unmute;
-      drawLyrics(true);
-    }
+  } else if (y < NP_BAR_Y) {  // cover or lyrics: a swipe turns the page, a tap (on release) a lyric line
+    swipeX0 = x;
+    swipeY0 = y;
+    inPages = true;
   } else if (y >= NP_CTRL_Y && y < NP_CTRL_Y + NP_CTRL_H) {
     if (x < 40) toggleShuffle();
     else if (x < 92) previousTrack();
