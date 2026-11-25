@@ -1,10 +1,16 @@
 #include "Ui.h"
 
+#include "ArtFetch.h"
+#include "ArtView.h"
 #include "AudioPlayer.h"
+#include "CardFile.h"
 #include "Catalog.h"
 #include "Config.h"
 #include "Lcd.h"
+#include "LibFormat.h"
+#include "LibStore.h"
 #include "Text.h"
+#include "ThumbStore.h"
 
 // ================================================================ Navigation model
 // Each tab has its own stack of levels; switching tabs returns to where you
@@ -32,6 +38,8 @@ struct Row {
   RowKind kind = R_NONE;
   uint32_t id = 0;
   String line1, line2, right;
+  uint32_t art = 0;   // artist, album and song rows: thumbnail key (artArtistKey, artAlbumKey); 0 none
+  uint32_t art2 = 0;  // song rows: cover to try if `art` has none (compilations)
 };
 
 #define MAX_NAV_DEPTH 12
@@ -70,6 +78,7 @@ enum CtxKind : uint8_t {
   CTX_TITLE,       // positions in title.idx
   CTX_ARTIST_IDX,  // positions in artist.idx (an artist's or album's songs)
   CTX_SONG_IDS,    // consecutive song ids (a folder's songs)
+  CTX_NONE_IDX,    // positions in none.idx (the Albums tab's "none")
 };
 
 struct PlayContext {
@@ -91,6 +100,7 @@ static bool ctxSong(const PlayContext &c, uint32_t i, uint32_t &id) {
     case CTX_TITLE: return Catalog::titleSong(c.start + i, id);
     case CTX_ARTIST_IDX: return Catalog::artistSong(c.start + i, id);
     case CTX_SONG_IDS: id = c.start + i; return true;
+    case CTX_NONE_IDX: return Catalog::noneSong(c.start + i, id);
     default: return false;
   }
 }
@@ -113,7 +123,9 @@ static PlayContext levelContext(const Level &l) {
       if (Catalog::artist(l.param, a)) c = {CTX_ARTIST_IDX, a.firstSongPos, a.songCount};
       break;
     case L_ALBUM_SONGS:
-      if (Catalog::album(l.param, al)) c = {CTX_ARTIST_IDX, al.firstSongPos, al.songCount};
+      if (Catalog::album(l.param, al)) {
+        c = {al.flags & ALBUM_NONE_ALL ? CTX_NONE_IDX : CTX_ARTIST_IDX, al.firstSongPos, al.songCount};
+      }
       break;
     case L_FOLDER:
       if (Catalog::folder(l.param, f)) c = {CTX_SONG_IDS, f.firstSong, f.songCount};
@@ -183,6 +195,16 @@ static bool songRow(uint32_t id, bool showTrackNumbers, Row &row) {
     row.line2 = String(t.track) + ". " + row.line2;
   }
   row.right = t.durationMs ? formatTime(t.durationMs) : String("");
+  // The album's cover key as the indexer names the album: album artist, else
+  // track artist, and the album name cut to AlbumRecord's size. A compilation
+  // (no album artist, several track artists) is filed under "Various
+  // Artists", which a song can't tell on its own, so that's the fallback.
+  if (t.album.length()) {
+    const String album = t.album.substring(0, sizeof(AlbumRecord::name) - 1);
+    const String &artist = t.albumArtist.length() ? t.albumArtist : t.artist;
+    row.art = artAlbumKey(artist.length() ? artist.c_str() : "Unknown Artist", album.c_str());
+    if (t.albumArtist.isEmpty()) row.art2 = artAlbumKey("Various Artists", album.c_str());
+  }
   return true;
 }
 
@@ -198,6 +220,7 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
       row.id = i;
       row.line1 = a.name;
       row.line2 = plural(a.albumCount, "album") + ", " + plural(a.songCount, "song");
+      row.art = artArtistKey(a.name);
       return true;
     case L_ARTIST_ALBUMS:
       if (!Catalog::artist(l.param, a)) return false;
@@ -206,6 +229,7 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
         row.id = l.param;
         row.line1 = "All songs";
         row.line2 = plural(a.songCount, "song");
+        row.art = artArtistKey(a.name);
         return true;
       }
       if (!Catalog::album(a.firstAlbum + i - 1, al)) return false;
@@ -213,13 +237,19 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
       row.id = a.firstAlbum + i - 1;
       row.line1 = al.name;
       row.line2 = (al.year ? String(al.year) + ", " : String("")) + plural(al.songCount, "song");
+      if (!(al.flags & ALBUM_NONE)) row.art = artAlbumKey(a.name, al.name);
       return true;
     case L_ALBUMS:
       if (!Catalog::albumByName(i, id) || !Catalog::album(id, al)) return false;
       row.kind = R_ALBUM;
       row.id = id;
       row.line1 = al.name;
+      if (al.flags & ALBUM_NONE_ALL) {  // every artist's loose songs
+        row.line2 = plural(al.songCount, "song") + ", every artist";
+        return true;
+      }
       row.line2 = Catalog::artist(al.artistId, a) ? String(a.name) : String("");
+      row.art = artAlbumKey(row.line2.c_str(), al.name);
       if (al.year) row.line2 += ", " + String(al.year);
       return true;
     case L_FOLDER:
@@ -238,8 +268,10 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
       return songRow(f.firstSong + (i - f.childCount), false, row);
     default: {  // song lists
       uint32_t songId;
-      return ctxSong(levelContext(l), i, songId) &&
-             songRow(songId, l.kind == L_ALBUM_SONGS, row);
+      // Track numbers in an album, not in a "none" album (by title).
+      const bool tracks = l.kind == L_ALBUM_SONGS && Catalog::album(l.param, al) &&
+                          !(al.flags & (ALBUM_NONE | ALBUM_NONE_ALL));
+      return ctxSong(levelContext(l), i, songId) && songRow(songId, tracks, row);
     }
   }
 }
@@ -364,6 +396,8 @@ static void resetListScroll() {
   setListOffset(0);
 }
 
+static void dropCover();
+
 // ================================================================ Drawing
 // Each draw function composes its region at (0,0) of the canvas, then blits.
 static String libraryStatus;
@@ -439,6 +473,80 @@ static void drawNav() {
   lcdBlit(0, NAV_Y, SCREEN_W, NAV_H);
 }
 
+// ================================================================ Thumbnails
+// Artist, album and song rows show a 30 px thumbnail from the ThumbStore
+// (one open file: a seek and a 2 KB read, a few ms). The last few are kept
+// in RAM so moving the list doesn't read the card for every frame, and keys
+// with none are remembered until the next tab switch. The download pass
+// makes the thumbnails; the list only reads them.
+#define THUMB_SLOTS 8
+struct ThumbSlot {
+  uint32_t key = 0;  // 0 = free
+  uint32_t used = 0;
+};
+static ThumbSlot thumbSlots[THUMB_SLOTS];
+static uint16_t *thumbPixels = nullptr;  // THUMB_SLOTS x ART_THUMB_BYTES, while needed
+static uint32_t thumbClock = 0;
+static bool thumbPending = false;  // a row shows a placeholder it may not need
+static ThumbStore thumbStore;
+// Store reads left for this frame of a moving list; rows past it show the
+// placeholder until the list stops.
+#define THUMB_LOOKUPS_PER_FRAME 2
+static int thumbLookups = THUMB_LOOKUPS_PER_FRAME;
+// Keys known to have no thumbnail, so their rows don't look again.
+#define THUMB_MISSING 64
+static uint32_t thumbMissing[THUMB_MISSING];
+static uint8_t thumbMissingNext = 0;
+
+static void releaseThumbs() {
+  free(thumbPixels);
+  thumbPixels = nullptr;
+  for (ThumbSlot &t : thumbSlots) t = ThumbSlot();
+  memset(thumbMissing, 0, sizeof(thumbMissing));  // pictures may have arrived meanwhile
+  thumbStore.retry();                             // and the store been created
+}
+
+// The thumbnail for a key, nullptr for none (or not yet, see thumbPending).
+// *missing is set when it's known not to exist.
+static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
+  *missing = false;
+  if (!thumbPixels) {
+    thumbPixels = static_cast<uint16_t *>(malloc(THUMB_SLOTS * ART_THUMB_BYTES));
+    if (!thumbPixels) return nullptr;
+  }
+  int slot = -1;
+  for (int i = 0; i < THUMB_SLOTS; i++) {
+    if (thumbSlots[i].key == key) slot = i;
+  }
+  if (slot < 0) {
+    for (uint32_t m : thumbMissing) {
+      if (m == key) {
+        *missing = true;
+        return nullptr;
+      }
+    }
+    if (!atRest && thumbLookups <= 0) {
+      thumbPending = true;
+      return nullptr;
+    }
+    thumbLookups--;
+    slot = 0;  // least recently used
+    for (int i = 1; i < THUMB_SLOTS; i++) {
+      if (thumbSlots[i].used < thumbSlots[slot].used) slot = i;
+    }
+    if (!thumbStore.read(key, thumbPixels + slot * (ART_THUMB * ART_THUMB))) {
+      thumbSlots[slot] = ThumbSlot();
+      thumbMissing[thumbMissingNext] = key;
+      thumbMissingNext = (thumbMissingNext + 1) % THUMB_MISSING;
+      *missing = true;
+      return nullptr;
+    }
+    thumbSlots[slot].key = key;
+  }
+  thumbSlots[slot].used = ++thumbClock;
+  return thumbPixels + slot * (ART_THUMB * ART_THUMB);
+}
+
 // Composes list row `index` (data `row`, or nullptr for an empty row) into the
 // canvas at (0,0). Stripes follow the index so they move with the list. When
 // marqueeY >= 0 the row is at rest at that screen line and a playing row's
@@ -451,20 +559,45 @@ static void composeRow(int32_t index, const Row *row, int16_t marqueeY) {
     return;
   }
   const bool drill = row->kind != R_SONG;
-  const int16_t textW = LIST_W - 18 - (drill ? 14 : 4);
-  if (playing) {
-    canvas->fillTriangle(5, 6, 5, 18, 13, 12, C_ACCENT);
+  // Album and song rows have a cover slot; folder rows (which share lists
+  // with songs) a big folder icon in the same place, so the text lines up.
+  const bool person = row->kind == R_ARTIST || row->kind == R_ALL_SONGS;
+  const bool thumb = person || row->kind == R_ALBUM || row->kind == R_SONG;
+  const int16_t textX = thumb || row->kind == R_FOLDER ? 36 : 18;
+  const int16_t textW = LIST_W - textX - (drill ? 14 : 4);
+  if (thumb) {
+    const uint16_t *px = nullptr;
+    bool missing = true;
+    if (row->art) px = thumbFor(row->art, marqueeY >= 0, &missing);
+    if (!px && missing && row->art2) px = thumbFor(row->art2, marqueeY >= 0, &missing);
+    if (px) {
+      canvas->drawRGBBitmap(1, 1, px, ART_THUMB, ART_THUMB);
+    } else if (person) {  // placeholder: head and shoulders
+      canvas->fillRect(1, 1, ART_THUMB, ART_THUMB, C_HEADER);
+      canvas->fillCircle(16, 12, 5, C_DIM);
+      canvas->fillRoundRect(7, 20, 18, 11, 5, C_DIM);
+      canvas->fillRect(7, 27, 18, 4, C_HEADER);
+    } else {  // placeholder: a dim square with a note
+      canvas->fillRect(1, 1, ART_THUMB, ART_THUMB, C_HEADER);
+      canvas->fillCircle(13, 21, 3, C_DIM);
+      canvas->fillRect(15, 9, 2, 12, C_DIM);
+      canvas->fillRect(15, 9, 6, 2, C_DIM);
+    }
+  }
+  if (playing) {  // a play badge over the cover
+    canvas->fillCircle(16, 16, 9, C_BG);
+    canvas->fillTriangle(13, 10, 13, 22, 22, 16, C_ACCENT);
   } else if (row->kind == R_FOLDER) {  // folder icon
-    canvas->fillRect(3, 9, 5, 2, C_DIM);
-    canvas->fillRect(3, 11, 11, 7, C_DIM);
+    canvas->fillRect(4, 7, 10, 3, C_DIM);
+    canvas->fillRect(4, 10, 24, 15, C_DIM);
   }
   if (playing && marqueeY >= 0) {
-    marqueeSet(listMarquee, row->line1, 18, marqueeY, textW, 2, C_ACCENT, bg);
-    marqueeCompose(listMarquee, 18, 4);
+    marqueeSet(listMarquee, row->line1, textX, marqueeY, textW, 2, C_ACCENT, bg);
+    marqueeCompose(listMarquee, textX, 4);
   } else {
     canvas->setTextSize(2);
     canvas->setTextColor(playing || row->kind == R_ALL_SONGS ? C_ACCENT : C_TEXT);
-    canvas->setCursor(18, 4);
+    canvas->setCursor(textX, 4);
     canvas->print(fitText(row->line1, textW / 12));
   }
   if (drill) {  // chevron: tapping opens it
@@ -473,8 +606,8 @@ static void composeRow(int32_t index, const Row *row, int16_t marqueeY) {
   canvas->setTextSize(1);
   canvas->setTextColor(C_DIM);
   const size_t rightChars = row->right.length();
-  canvas->setCursor(18, 22);
-  canvas->print(fitText(row->line2, (LIST_W - 18 - 4) / 6 - (rightChars ? rightChars + 1 : 0)));
+  canvas->setCursor(textX, 22);
+  canvas->print(fitText(row->line2, (LIST_W - textX - (drill ? 14 : 4)) / 6 - (rightChars ? rightChars + 1 : 0)));
   if (rightChars) {
     canvas->setCursor(LIST_W - 4 - rightChars * 6, 22);
     canvas->print(row->right);
@@ -682,6 +815,7 @@ static uint32_t firstFrameAt = 0;
 
 static void drawMovingList() {
   const uint32_t t0 = millis();
+  thumbLookups = THUMB_LOOKUPS_PER_FRAME;
   if (movingFrames == 0) firstFrameAt = t0;
   const int32_t delta = scrollPx - shownPx;
   if (delta >= LIST_H || delta <= -LIST_H) {
@@ -745,6 +879,10 @@ static void settleList() {
     }
   }
   shownPx = scrollPx;
+  if (thumbPending) {  // rows drawn while moving left placeholders
+    thumbPending = false;
+    drawRows();
+  }
   updateStrip();
   if (movingFrames) {
     const uint32_t total = millis() - firstFrameAt;
@@ -997,6 +1135,7 @@ static void drawControls() {
 }
 
 void uiShowStatus(const char *line1, const char *line2) {
+  dropCover();
   resetListScroll();
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
   drawCenteredText(line1, SCREEN_W / 2, 6, 2, C_TEXT);
@@ -1006,6 +1145,7 @@ void uiShowStatus(const char *line1, const char *line2) {
 
 // Clears the screen under a plain "MP3 Player" header.
 static void drawPlainScreen() {
+  dropCover();
   resetListScroll();
   lcdFillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H, C_BG);
   canvas->fillRect(0, 0, SCREEN_W, HEADER_H, C_HEADER);
@@ -1079,6 +1219,7 @@ void uiShowProgress(bool redraw, const char *title, const char *phase, float fra
 }
 
 void uiShowPlayer() {
+  dropCover();
   static bool initialized = false;
   if (!initialized) {
     resetTabs();
@@ -1095,6 +1236,130 @@ void uiShowPlayer() {
   drawList();
   drawNowPlaying();
   drawControls();
+}
+
+// ================================================================ Cover view
+// Tap the now-playing panel: the playing song's album cover, full width,
+// with its names and how the cover was drawn (a test view for the art
+// cache). Any tap closes it. While it's up the LCD is muted, so the player
+// screen's own updates don't draw over it; uiShowPlayer() redraws them.
+#define COVER_SIZE SCREEN_W  // 240 x 240 at the top
+static bool coverOpen = false;
+static uint32_t coverSongId = 0;
+
+// The album a song belongs to: albums with its album name (the library
+// keeps 43 bytes of it) whose songs include it. Albums are read in one
+// sequential scan, about 140 KB for 2,000 albums.
+static bool findAlbumOf(const Track &t, AlbumRecord &album, ArtistRecord &artist) {
+  if (t.album.isEmpty()) {
+    return false;
+  }
+  LibReader albums;
+  if (!albums.open(Catalog::generation(), LF_ALBUMS, sizeof(AlbumRecord))) {
+    return false;
+  }
+  albums.setReadAhead(4096);
+  for (uint32_t i = 0; i < albums.count(); i++) {
+    if (!albums.read(i, &album)) {
+      return false;
+    }
+    const String name(album.name, strnlen(album.name, sizeof(album.name)));
+    if (name.isEmpty() || !t.album.startsWith(name)) {
+      continue;
+    }
+    for (uint32_t s = 0; s < album.songCount; s++) {
+      uint32_t id;
+      if (Catalog::artistSong(album.firstSongPos + s, id) && id == t.id) {
+        return Catalog::artist(album.artistId, artist);
+      }
+    }
+  }
+  return false;
+}
+
+static void drawCover() {
+  coverSongId = current.id;
+  lcdSetMuted(false);
+  setListOffset(0);  // the cover covers the hardware-scrolled list area
+  const uint32_t t0 = millis();
+  AlbumRecord album;
+  ArtistRecord artist;
+  const bool found = findAlbumOf(current, album, artist);
+  const uint32_t findMs = millis() - t0;
+  String albumName, artistName, info;
+  ArtDrawResult art;
+  if (found) {
+    albumName = String(album.name, strnlen(album.name, sizeof(album.name)));
+    artistName = String(artist.name, strnlen(artist.name, sizeof(artist.name)));
+    const String jpg = artCoverPath(artistName.c_str(), albumName.c_str());
+    String marker = jpg;
+    marker.replace(".jpg", ".no");
+    FILINFO fi;
+    lcdFillRect(0, 0, SCREEN_W, COVER_SIZE, C_BG);
+    if (f_stat(cardPath(jpg).c_str(), &fi) == FR_OK) {
+      art = artDrawJpeg(cardPath(jpg), 0, 0, COVER_SIZE, COVER_SIZE);
+      info = art.ok ? String(art.width) + "x" + art.height + (art.scale ? " 1/" + String(1 << art.scale) : "") + ", " +
+                          String((art.bytes + 512) / 1024) + " KB, " + art.ms + " ms"
+                    : String("Can't show: ") + art.error;
+    } else if (f_stat(cardPath(marker).c_str(), &fi) == FR_OK) {
+      info = "No cover found online";
+    } else {
+      info = "Not downloaded yet";
+    }
+    Serial.printf("[cover] \"%s\" by \"%s\": %s (%s); album found in %lu ms\n", albumName.c_str(),
+                  artistName.c_str(), jpg.c_str(), info.c_str(), findMs);
+  } else {
+    info = current.album.isEmpty() ? "No album tag" : "Album not in the library";
+    Serial.printf("[cover] album of song %lu not found (%lu ms)\n", current.id, findMs);
+  }
+  if (!art.ok) {  // placeholder
+    lcdFillRect(0, 0, SCREEN_W, COVER_SIZE, C_HEADER);
+    canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_HEADER);
+    drawCenteredText("No cover", SCREEN_W / 2, 14, 2, C_DIM);
+    lcdBlit(0, COVER_SIZE / 2 - CANVAS_H / 2, SCREEN_W, CANVAS_H);
+  }
+
+  // Names under the cover, then the test details.
+  canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
+  canvas->setTextSize(1);
+  canvas->setTextColor(C_TEXT);
+  canvas->setCursor(8, 6);
+  canvas->print(fitText(current.title, 37));
+  canvas->setTextColor(C_TEXT);
+  canvas->setCursor(8, 18);
+  canvas->print(fitText(found ? albumName : current.album, 37));
+  canvas->setTextColor(C_ACCENT);
+  canvas->setCursor(8, 30);
+  canvas->print(fitText(found ? artistName : current.artist, 37));
+  lcdBlit(0, COVER_SIZE, SCREEN_W, CANVAS_H);
+  canvas->fillRect(0, 0, SCREEN_W, SCREEN_H - COVER_SIZE - CANVAS_H, C_BG);
+  canvas->setTextColor(C_DIM);
+  canvas->setCursor(8, 4);
+  canvas->print(fitText(info, 37));
+  canvas->setCursor(8, 20);
+  canvas->print("Tap to close");
+  lcdBlit(0, COVER_SIZE + CANVAS_H, SCREEN_W, SCREEN_H - COVER_SIZE - CANVAS_H);
+  lcdSetMuted(true);
+}
+
+static void openCover() {
+  stopList();
+  coverOpen = true;
+  drawCover();
+}
+
+// Ends the cover view without drawing (another screen takes over).
+static void dropCover() {
+  if (coverOpen) {
+    coverOpen = false;
+    lcdSetMuted(false);
+    lcdScrollOffset(listOffset);  // may have moved while muted
+  }
+}
+
+static void closeCover() {
+  dropCover();
+  uiShowPlayer();
 }
 
 // ================================================================ Actions
@@ -1240,6 +1505,7 @@ static void selectTab(int t) {
     tabs[t].depth = 1;  // tapping the current tab goes back to its top
   }
   activeTab = t;
+  releaseThumbs();  // forget "missing": pictures may have arrived meanwhile
   drawTabs();
   drawNav();
   drawList();
@@ -1295,6 +1561,14 @@ void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
     return;
   }
   // TOUCH_DOWN
+  if (coverOpen) {
+    closeCover();
+    return;
+  }
+  if (y >= LIST_END && y < CTRL_Y && playIndex >= 0) {  // now-playing panel
+    openCover();
+    return;
+  }
   if (y >= LIST_Y && y < LIST_END && x < LIST_W) {
     listTouchDown(y);  // a tap fires on release if the finger didn't move
     return;
@@ -1383,6 +1657,10 @@ void uiTick() {
   if (statusHoldStart && millis() - statusHoldStart >= REBUILD_HOLD_MS) {
     statusHoldStart = 0;
     rebuildRequested = true;
+  }
+
+  if (coverOpen && playIndex >= 0 && current.id != coverSongId) {
+    drawCover();  // the next song started: maybe another album
   }
 
   tickList();

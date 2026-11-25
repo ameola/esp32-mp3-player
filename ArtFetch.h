@@ -1,6 +1,7 @@
 #pragma once
 // Album art downloads (MusicBrainz search, Cover Art Archive 250 px front
-// cover) into LIB_DIR "/art/xx/<key>.jpg"; albums without a cover get a
+// cover) and artist photos (Deezer search, 250 px) into
+// LIB_DIR "/art/xx/<key>.jpg"; albums and artists without one get a
 // "<key>.no" marker, retried after 30 days. <key> is a hash of album artist
 // and album name, so the cache survives library rebuilds.
 //
@@ -16,9 +17,16 @@ void artFetchSetEnabled(bool on);     // per-card setting (CardSettings)
 // player has been idle for a while and the library isn't being updated.
 void artFetchTick();
 void artFetchNow();                   // start a pass without waiting (Serial "artfetch")
+// Test (Serial "artartists"): a pass that starts at the artist steps; the
+// albums skipped are looked at by the next pass.
+void artFetchArtistsNow();
 void artFetchStop();                  // blocks until WiFi is off again
 bool artFetchRunning();
 // Progress for the status corner ("Art\n12%"), "" when not running.
 String artFetchStatus();
+// Thumbnail keys (ThumbStore) of an album's cover and an artist's photo; 0
+// for none (no album name, "Unknown Artist").
+uint32_t artAlbumKey(const char *albumArtist, const char *album);
+uint32_t artArtistKey(const char *artist);
 // Cache path of an album's cover ("" if the name is empty).
 String artCoverPath(const char *albumArtist, const char *album);

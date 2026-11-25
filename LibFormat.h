@@ -12,6 +12,7 @@
 //     artist.idx   song ids by artist, year, album, disc, track; each artist's
 //                  and each album's songs are contiguous (no extra)
 //     album.idx    album ids sorted by album name (extra: JumpTable)
+//     none.idx     song ids of every artist's "none" album, by title
 //     manifest.dat one ManifestRecord, written LAST
 //     title.keys, artist.keys  optional: the sorted 48-byte sort records behind
 //                  title.idx / artist.idx, so the next build can merge in a
@@ -36,7 +37,11 @@
 
 #define LIB_DIR "/.mp3player"
 #define LIB_MAGIC "MP3L"
-#define LIB_FORMAT_VERSION 2
+// Song text is cleaned while tagging (LibClean.h); new rules need every song
+// retagged, so their version is part of the format version.
+#define LIB_CLEAN_VERSION 3
+// 3x: cleaned names, "none" albums, duplicates hidden (x = LIB_CLEAN_VERSION)
+#define LIB_FORMAT_VERSION (30 + LIB_CLEAN_VERSION)
 #define LIB_NONE 0xFFFFFFFFu
 
 enum LibFileType : uint8_t {
@@ -49,6 +54,7 @@ enum LibFileType : uint8_t {
   LF_TITLE_INDEX,
   LF_ARTIST_INDEX,
   LF_ALBUM_INDEX,
+  LF_NONE_INDEX,
   LF_TYPE_COUNT,
   // Indexer working files (never part of a valid generation).
   LF_TEMP_SKELETON = 20,
@@ -122,12 +128,21 @@ struct __attribute__((packed)) ArtistRecord {
 };
 static_assert(sizeof(ArtistRecord) == 64, "ArtistRecord size");
 
+// AlbumRecord flags. An artist's songs from albums of 3 songs or fewer and
+// without an album are their "none" album (ALBUM_NONE, by title, last of
+// the artist's albums, not in album.idx). The Albums tab's "none" is one
+// more record (ALBUM_NONE_ALL, artistId LIB_NONE) over none.idx.
+#define ALBUM_NONE 1
+#define ALBUM_NONE_ALL 2
+#define NONE_ALBUM_NAME "none"
+#define NONE_MAX_SONGS 3  // albums with this many songs or fewer go to "none"
+
 struct __attribute__((packed)) AlbumRecord {
   char name[44];
   uint32_t artistId;
   uint16_t year;
-  uint16_t reserved0;
-  uint32_t firstSongPos;  // position in artist.idx (an album's songs are contiguous)
+  uint16_t flags;         // ALBUM_NONE, ALBUM_NONE_ALL
+  uint32_t firstSongPos;  // position in artist.idx (an album's songs are contiguous); none.idx for ALBUM_NONE_ALL
   uint32_t songCount;
   uint32_t reserved1;
 };
@@ -141,6 +156,8 @@ struct __attribute__((packed)) JumpTable {
 };
 
 // Index entries are uint32_t ids: song ids, except album.idx (album ids).
+// Songs that are duplicates of another (same title and artist after
+// cleaning, length within 2 s) are in no index; their folders still list them.
 
 struct __attribute__((packed)) ManifestRecord {
   uint32_t songCount;

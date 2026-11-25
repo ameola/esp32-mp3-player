@@ -1,4 +1,6 @@
 #include "LibStore.h"
+
+#include "LibClean.h"
 #include <new>
 
 #include <esp_rom_crc.h>
@@ -19,6 +21,7 @@ const char *const kLibFileNames[LF_TYPE_COUNT] = {
   "title.idx",
   "artist.idx",
   "album.idx",
+  "none.idx",
 };
 
 uint8_t libBucket(const char *text) {
@@ -52,6 +55,7 @@ void libFillSong(SongRecord &rec, const TagInfo &tags, const char *fileName) {
   rec.durationSource = tags.durationSource;
   rec.audioStart = tags.audioStart;
   rec.audioEnd = tags.audioEnd;
+  libCleanSong(rec, fileName);
 }
 
 static uint32_t crc32(uint32_t crc, const void *data, size_t len) {

@@ -111,6 +111,7 @@ static void indexTask(void *) {
                 stats.reused, stats.tagged, ESP.getMinFreeHeap(),
                 stats.error.isEmpty() ? "" : ": ", stats.error.c_str());
   if (stats.ok && !stats.unchanged) {
+    Serial.printf("  %lu duplicates hidden, %lu songs in \"none\" albums\n", stats.duplicates, stats.noneSongs);
     Serial.printf("  sort %s%s%s (kept %lu songs)\n", stats.sortPatched ? "patched" : "full",
                   stats.patchSkipped.isEmpty() ? "" : ": ", stats.patchSkipped.c_str(),
                   stats.keptSongs);

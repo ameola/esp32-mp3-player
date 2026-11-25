@@ -31,3 +31,14 @@ void lcdBlitFrom(int16_t fromY, int16_t dstX, int16_t dstY, int16_t w, int16_t h
 // top+i shows memory line top + (i + offset) % height.
 void lcdScrollArea(int16_t top, int16_t height);
 void lcdScrollOffset(int16_t offset);  // 0 .. height-1
+
+// Sends w x h RGB565 pixels (row by row) to the screen at (x, y), clipped to
+// the screen. Ignores lcdSetMuted.
+void lcdPushPixels(int16_t x, int16_t y, int16_t w, int16_t h, const uint16_t *pixels);
+
+// While muted, lcdFillRect, lcdBlit, lcdBlitFrom and lcdScrollOffset do
+// nothing: a full-screen view (the album cover) keeps the player screen's
+// own updates (progress, marquees, status) from drawing over it. The view
+// unmutes around its own drawing.
+void lcdSetMuted(bool muted);
+bool lcdMuted();

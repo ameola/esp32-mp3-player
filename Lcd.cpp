@@ -144,8 +144,31 @@ static void lcdEndData() {
   SPI.endTransaction();
 }
 
+static bool muted = false;
+
+void lcdSetMuted(bool on) { muted = on; }
+bool lcdMuted() { return muted; }
+
+void lcdPushPixels(int16_t x, int16_t y, int16_t w, int16_t h, const uint16_t *pixels) {
+  int16_t cx = x, cy = y, cw = w, ch = h;
+  if (!lcdSetWindow(cx, cy, cw, ch)) {
+    return;
+  }
+  static uint8_t line[SCREEN_W * 2];
+  for (int row = 0; row < ch; row++) {
+    const uint16_t *src = pixels + (cy - y + row) * w + (cx - x);
+    for (int i = 0; i < cw; i++) {
+      line[i * 2] = src[i] >> 8;
+      line[i * 2 + 1] = src[i] & 0xFF;
+    }
+    lcdBeginData();
+    SPI.writeBytes(line, cw * 2);
+    lcdEndData();
+  }
+}
+
 void lcdFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
-  if (!lcdSetWindow(x, y, w, h)) {
+  if (muted || !lcdSetWindow(x, y, w, h)) {
     return;
   }
   static uint8_t line[SCREEN_W * 2];
@@ -166,7 +189,7 @@ void lcdBlit(int16_t dstX, int16_t dstY, int16_t w, int16_t h) {
 
 void lcdBlitFrom(int16_t fromY, int16_t dstX, int16_t dstY, int16_t w, int16_t h) {
   int16_t x = dstX, y = dstY, cw = w, ch = h;
-  if (!lcdSetWindow(x, y, cw, ch)) {
+  if (muted || !lcdSetWindow(x, y, cw, ch)) {
     return;
   }
   const uint16_t *pixels = canvas->getBuffer();
@@ -201,6 +224,9 @@ void lcdScrollArea(int16_t top, int16_t height) {
 }
 
 void lcdScrollOffset(int16_t offset) {
+  if (muted) {
+    return;
+  }
   const int16_t line = scrollTop + offset;
   const uint8_t start[] = {static_cast<uint8_t>(line >> 8), static_cast<uint8_t>(line)};
   writeLcdCommand(0x37, start, sizeof(start));  // VSCRSADD

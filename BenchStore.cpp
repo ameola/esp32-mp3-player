@@ -190,7 +190,8 @@ static bool buildGeneration(uint32_t gen, BuildStats &stats, uint32_t stopAfterS
   if (!w.create(gen, LF_ARTISTS, sizeof(ArtistRecord)) || !w.finish() ||
       !w.create(gen, LF_ALBUMS, sizeof(AlbumRecord)) || !w.finish() ||
       !w.create(gen, LF_ARTIST_INDEX, sizeof(uint32_t), sizeof(JumpTable)) || !w.finish(&empty) ||
-      !w.create(gen, LF_ALBUM_INDEX, sizeof(uint32_t), sizeof(JumpTable)) || !w.finish(&empty)) {
+      !w.create(gen, LF_ALBUM_INDEX, sizeof(uint32_t), sizeof(JumpTable)) || !w.finish(&empty) ||
+      !w.create(gen, LF_NONE_INDEX, sizeof(uint32_t)) || !w.finish()) {
     return false;
   }
   stats.indexMs = millis() - t1;

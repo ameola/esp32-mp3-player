@@ -7,16 +7,21 @@
 #include <esp_http_client.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
+#include <new>
 #include <time.h>
 
 #include "ArtScan.h"
+#include "ArtView.h"
 #include "AudioPlayer.h"
 #include "CardFile.h"
 #include "Catalog.h"
 #include "Config.h"
 #include "LibFormat.h"
+#include "LibClean.h"
 #include "LibStore.h"
 #include "Library.h"
+#include "Text.h"
+#include "ThumbStore.h"
 #include "WifiSetup.h"
 
 namespace {
@@ -25,11 +30,18 @@ namespace {
 #define IDLE_BEFORE_MS 10000         // nothing playing this long: start a pass
 #define RETRY_AFTER_MS (10 * 60000)  // after a network failure
 #define MISSING_RETRY_DAYS 30
-#define MB_INTERVAL_MS 1100          // MusicBrainz allows one request per second
-#define JSON_BYTES 1536              // start of a search answer: the first match
+// MusicBrainz allows one request per second, but answered half of them 503
+// (busy) at 1.1 s apart.
+#define MB_INTERVAL_MS 2000
+// Deezer (artist photos) allows 50 requests per 5 seconds.
+#define DZ_INTERVAL_MS 500
 #define MIN_FREE_FOR_WIFI 90000      // WiFi ~43 KB + TLS ~45 KB
 #define HTTP_TIMEOUT_MS 5000         // also bounds how long a stop request waits
 #define TASK_STACK 8192              // TLS handshake runs on it
+// Pause between card lookups of the steps that use no network (artist
+// stand-ins, thumbnails), so the list on screen still gets the card: back
+// to back they made each of its thumbnail reads take 30-70 ms, not 5-10.
+#define CARD_PAUSE_MS 10
 
 enum Outcome { O_SAVED, O_NONE, O_NET_ERROR, O_STOPPED };
 
@@ -42,7 +54,11 @@ uint32_t retryAt = 0;
 uint32_t cursor = 0;              // next album to look at (survives stopped passes)
 uint32_t cursorGen = LIB_NONE;    // generation the cursor belongs to
 uint32_t finishedGen = LIB_NONE;  // every album of this generation was handled
+bool albumsSkipped = false;       // artFetchArtistsNow: this pass started past the albums
 uint32_t lastMbRequest = 0;
+uint32_t lastDzRequest = 0;
+ThumbStore store;  // the pass's handle (the UI has its own)
+uint16_t thumbPixels[ART_THUMB * ART_THUMB];
 uint32_t passGen = LIB_NONE;
 
 uint32_t freeHeap() { return heap_caps_get_free_size(MALLOC_CAP_8BIT); }
@@ -57,7 +73,9 @@ bool nap(uint32_t ms) {
 }
 
 // ---------------------------------------------------------------- names
-uint32_t albumKey(const char *artist, const char *album) {
+// Keys before names were normalized (FNV-1a of the names as shown, case
+// folded); only used to move pictures saved under them (migrateKeys()).
+uint32_t legacyAlbumKey(const char *artist, const char *album) {
   uint32_t h = 2166136261u;  // FNV-1a, case-insensitive
   auto mix = [&h](const char *s) {
     for (; *s; s++) {
@@ -70,6 +88,22 @@ uint32_t albumKey(const char *artist, const char *album) {
   h *= 16777619u;
   mix(album);
   return h;
+}
+
+uint32_t legacyArtistKey(const char *artist) {
+  return legacyAlbumKey(artist, "\x01");
+}
+
+// A picture's key: a hash of the album artist and album name, normalized
+// like the library groups them (LibClean), so "KoRn" and "Korn", or an
+// album's "Disc 1" and "Disc 2", share one.
+uint32_t albumKey(const char *artist, const char *album) {
+  return legacyAlbumKey(libNormName(artist, true).c_str(), libNormName(album, false).c_str());
+}
+
+// An artist's photo: a key no album has (album names have no \x01).
+uint32_t artistKey(const char *artist) {
+  return albumKey(artist, "\x01");
 }
 
 String keyPath(uint32_t key, const char *ext) {
@@ -137,14 +171,314 @@ String phrase(const String &s) {  // a quoted Lucene phrase
   return out + "\"";
 }
 
-String jsonString(const char *from, const char *key) {
-  const String k = String("\"") + key + "\":\"";
-  const char *p = strstr(from, k.c_str());
-  if (!p) return "";
-  p += k.length();
-  const char *end = strchr(p, '"');
-  return end ? String(p).substring(0, end - p) : String();
+// A name reduced for comparing card tags with MusicBrainz: lower case, "&"
+// and "+" as "and", punctuation (also typographic quotes and dashes) gone,
+// "vol"/"volume" dropped, single spaces.
+String comparable(const String &s, bool dropLeadingThe) {
+  String words;
+  auto space = [&] {
+    if (words.length() && words[words.length() - 1] != ' ') words += ' ';
+  };
+  for (size_t i = 0; i < s.length(); i++) {
+    const uint8_t c = s[i];
+    if (c == 0xE2 && i + 2 < s.length() && static_cast<uint8_t>(s[i + 1]) == 0x80) {
+      // U+2000..U+203F: ’ ‘ “ ” – — … and friends. ’ and ‘ go like ',
+      // "That’s" is "That's" is "Thats".
+      const uint8_t c2 = s[i + 2];
+      i += 2;
+      if (c2 != 0x98 && c2 != 0x99) space();
+    } else if (c == '&' || c == '+') {
+      space();
+      words += "and ";
+    } else if (c >= 0x80 || isalnum(c)) {
+      words += static_cast<char>(tolower(c));
+    } else if (c != '\'') {  // "Rock 'n' Roll" and "Rock n Roll" alike
+      space();
+    }
+  }
+  words.trim();
+  String out;
+  for (int start = 0; start < static_cast<int>(words.length());) {
+    int end = words.indexOf(' ', start);
+    if (end < 0) end = words.length();
+    const String w = words.substring(start, end);
+    const bool drop = w == "vol" || w == "volume" || (dropLeadingThe && start == 0 && w == "the");
+    if (!drop) out += (out.length() ? " " : "") + w;
+    start = end + 1;
+  }
+  return out;
 }
+
+int wordCount(const String &s) {
+  int n = s.length() ? 1 : 0;
+  for (size_t i = 0; i < s.length(); i++) n += s[i] == ' ';
+  return n;
+}
+
+String withoutLastWord(const String &s) {
+  const int sp = s.lastIndexOf(' ');
+  return sp > 0 ? s.substring(0, sp) : s;
+}
+
+// The card's album name for comparing: a name the library cut at 43
+// characters loses its last, maybe partial, word ("...Collection D").
+String cardTitle(const String &album, bool truncated) {
+  const String a = comparable(searchName(album), false);
+  return truncated ? withoutLastWord(a) : a;
+}
+
+// Words of the album name a loose search requires (AND), without the ones
+// MusicBrainz titles often spell differently ("&", "+", "and", "Vol.") and
+// words with an apostrophe (MusicBrainz finds "ain't", not "aint" or "ain").
+String titleQuery(const String &album, bool truncated) {
+  String name = searchName(album);
+  name.trim();
+  if (truncated) name = withoutLastWord(name);
+  String q;
+  for (int start = 0; start < static_cast<int>(name.length());) {
+    int end = name.indexOf(' ', start);
+    if (end < 0) end = name.length();
+    const String token = name.substring(start, end);
+    start = end + 1;
+    if (token.indexOf('\'') >= 0 || token.indexOf("\xE2\x80\x99") >= 0) continue;
+    const String words = comparable(token, false);  // "Up-Up" is two words
+    for (int s = 0; s < static_cast<int>(words.length());) {
+      int e = words.indexOf(' ', s);
+      if (e < 0) e = words.length();
+      const String w = words.substring(s, e);
+      s = e + 1;
+      if (w != "and" && w != "the") q += (q.length() ? " AND " : "") + w;
+    }
+  }
+  return q;
+}
+
+// How well a MusicBrainz title fits the card's album name: 2 the same
+// (after comparable()), 1 one is the other plus more words, 0 no. The
+// "plus more words" cases: a name the library cut short; "Greatest Hits,
+// Vol. 1" for "Greatest Hits 1 1962-1965"; "You Ain't Heard Nothin' Yet:
+// Jolie's Finest" for "You Ain't Heard Nothin' Yet!". Short names must match
+// exactly ("Greatest Hits" isn't "Greatest Hits 2").
+int titleFit(const String &album, const String &mb, bool truncated) {
+  const String a = cardTitle(album, truncated);
+  const String b = comparable(searchName(mb), false);
+  if (a.isEmpty()) return 0;
+  if (a == b) return 2;
+  if (b.startsWith(a + " ") && (truncated || wordCount(a) >= 3)) return 1;
+  if (a.startsWith(b + " ") && wordCount(b) >= 4) return 1;
+  return 0;
+}
+
+String noSpaces(String s) {
+  s.replace(" ", "");
+  return s;
+}
+
+// Names that may have been cut short: at the library's 43 or 47 bytes, or
+// at the 30 characters of an ID3v1 tag ("Ben Harper and the Innocent Cri").
+bool maybeTruncated(const String &name, size_t fieldBytes) {
+  return name.length() >= fieldBytes - 2 || name.length() == 30 || name.length() == 31;
+}
+
+bool sameArtist(const String &card, const String &mb) {  // "2 Pac" is "2Pac"
+  const String a = comparable(card, true), b = comparable(mb, true);
+  if (a.isEmpty()) return false;
+  if (noSpaces(a) == noSpaces(b)) return true;
+  // "Ben Harper and the Innocent Cri": "Ben Harper & The Innocent Criminals".
+  const String start = withoutLastWord(a);
+  return maybeTruncated(card, sizeof(ArtistRecord::name)) && wordCount(start) >= 2 && b.startsWith(start + " ");
+}
+
+// One release group of a search answer.
+struct Match {
+  String id, title, artist;  // artist: the first name of its artist credit
+  int score = 0;
+};
+#define MAX_MATCHES 3
+
+// Reads the release groups of a search answer as it streams in, keeping
+// only what Match needs: groups carry aliases, tags and every release, a few
+// KB each.
+class GroupReader {
+ public:
+  Match matches[MAX_MATCHES];
+  int count = 0;
+
+  void feed(const uint8_t *d, int n) {
+    for (int i = 0; i < n; i++) step(static_cast<char>(d[i]));
+  }
+
+ private:
+  // Depth 1 is the answer, 2 the "release-groups" array, 3 one group;
+  // the artist credit's first name sits at depth 5.
+  int depth = 0;
+  bool inString = false, escaped = false, afterColon = false;
+  bool inGroups = false, inCredit = false;
+  String text, key;
+  Match cur;
+  bool inGroup = false;
+
+  void step(char c) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        if (text.length() < 120) text += c;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+        if (afterColon) value(text);
+        else key = text;
+        afterColon = false;
+      } else if (text.length() < 120) {
+        text += c;
+      }
+      return;
+    }
+    switch (c) {
+      case '"': inString = true; text = ""; break;
+      case ':': afterColon = true; break;
+      case ',': afterColon = false; break;
+      case '{':
+      case '[':
+        if (depth == 1 && c == '[') inGroups = key == "release-groups";
+        if (depth == 2 && c == '{' && inGroups) {
+          cur = Match();
+          inGroup = true;
+        }
+        if (depth == 3 && inGroup) inCredit = key == "artist-credit";
+        depth++;
+        afterColon = false;
+        break;
+      case '}':
+      case ']':
+        depth--;
+        if (depth == 3) inCredit = false;
+        if (depth == 2 && c == '}' && inGroup) {
+          inGroup = false;
+          if (count < MAX_MATCHES) matches[count++] = cur;
+        }
+        if (depth == 1) inGroups = false;
+        break;
+      default:
+        if (afterColon && inGroup && depth == 3 && key == "score" && isdigit(static_cast<unsigned char>(c))) {
+          cur.score = cur.score * 10 + (c - '0');
+        }
+    }
+  }
+
+  void value(const String &v) {
+    if (!inGroup) return;
+    if (depth == 3) {
+      if (key == "id") cur.id = v;
+      else if (key == "title") cur.title = v;
+    } else if (depth == 5 && inCredit && key == "name" && cur.artist.isEmpty()) {
+      cur.artist = v;
+    }
+  }
+};
+
+// One artist of a Deezer search answer.
+struct ArtistMatch {
+  String name;     // display text (accents folded, like the card's names)
+  String picture;  // 250 px photo URL
+};
+#define MAX_ARTISTS 5
+
+// Reads {"data":[{"name":..,"picture_medium":..},..]} as it streams in.
+// Deezer escapes non-ASCII letters (\u00e9); raw UTF-8 is handled too.
+class ArtistReader {
+ public:
+  ArtistMatch matches[MAX_ARTISTS];
+  int count = 0;
+  bool error = false;  // {"error":{..}}: e.g. over the request quota
+
+  void feed(const uint8_t *d, int n) {
+    for (int i = 0; i < n; i++) step(static_cast<char>(d[i]));
+  }
+
+ private:
+  int depth = 0;
+  bool inString = false, escaped = false, afterColon = false, inData = false, inItem = false;
+  int hexLeft = 0;
+  uint32_t cp = 0;
+  String text, key;
+  ArtistMatch cur;
+
+  void add(char c) {
+    if (text.length() < 200) text += c;
+  }
+  void addCodepoint(uint32_t c) {  // as UTF-8, decoded with the rest
+    if (c < 0x80) {
+      add(c);
+    } else if (c < 0x800) {
+      add(0xC0 | (c >> 6));
+      add(0x80 | (c & 63));
+    } else {
+      add(0xE0 | (c >> 12));
+      add(0x80 | ((c >> 6) & 63));
+      add(0x80 | (c & 63));
+    }
+  }
+
+  void step(char c) {
+    if (inString) {
+      if (hexLeft) {
+        cp = cp * 16 + (isdigit(static_cast<unsigned char>(c)) ? c - '0' : (tolower(c) - 'a' + 10) & 15);
+        if (--hexLeft == 0) addCodepoint(cp);
+      } else if (escaped) {
+        escaped = false;
+        if (c == 'u') {
+          hexLeft = 4;
+          cp = 0;
+        } else {
+          add(c == 'n' || c == 't' || c == 'r' ? ' ' : c);
+        }
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+        if (afterColon) value();
+        else key = text;
+        afterColon = false;
+      } else {
+        add(c);
+      }
+      return;
+    }
+    switch (c) {
+      case '"': inString = true; text = ""; break;
+      case ':': afterColon = true; break;
+      case ',': afterColon = false; break;
+      case '{':
+      case '[':
+        if (depth == 1 && c == '[') inData = key == "data";
+        if (depth == 1 && c == '{' && afterColon && key == "error") error = true;
+        if (depth == 2 && c == '{' && inData) {
+          cur = ArtistMatch();
+          inItem = true;
+        }
+        depth++;
+        afterColon = false;
+        break;
+      case '}':
+      case ']':
+        depth--;
+        if (depth == 2 && c == '}' && inItem) {
+          inItem = false;
+          if (count < MAX_ARTISTS) matches[count++] = cur;
+        }
+        if (depth == 1) inData = false;
+        break;
+    }
+  }
+
+  void value() {
+    if (!inItem || depth != 3) return;
+    if (key == "name") cur.name = decodeUtf8(reinterpret_cast<const uint8_t *>(text.c_str()), text.length());
+    else if (key == "picture_medium") cur.picture = text;
+  }
+};
 
 // ---------------------------------------------------------------- WiFi
 // ESP-IDF directly, with fewer buffers than the Arduino WiFi class uses (it
@@ -289,65 +623,57 @@ int httpGet(const String &url, Sink sink) {
 }
 
 // ---------------------------------------------------------------- one album
+// A "no cover" marker's size is the version of the search that wrote it;
+// smaller ones are retried once. 0: exact phrases only, which missed many
+// albums. 2: before curly apostrophes and cut-short artists were handled.
+#define MARKER_SIZE 3
+
 bool writeMarker(uint32_t key) {
   FIL *f = cardNewFil();
   bool ok = f && f_open(f, cardPath(keyPath(key, "no")).c_str(), FA_WRITE | FA_CREATE_ALWAYS) == FR_OK;
-  if (ok) f_close(f);  // empty: its date is what counts
+  if (ok) {  // its date is what counts
+    UINT w = 0;
+    ok = cardWrite(f, "v3\n", MARKER_SIZE, &w) == FR_OK && w == MARKER_SIZE;
+    f_close(f);
+  }
   cardDeleteFil(f);
   return ok;
 }
 
-Outcome fetchAlbum(uint32_t key, const String &album, const String &artist) {
-  // 1. Search (plain HTTP: no TLS needed).
-  if (!nap(MB_INTERVAL_MS - min<uint32_t>(MB_INTERVAL_MS, millis() - lastMbRequest))) return O_STOPPED;
-  String query = "releasegroup:" + phrase(searchName(album));
-  query += " AND artist:" + phrase(artist);
-  const String url = "http://musicbrainz.org/ws/2/release-group/?fmt=json&limit=1&query=" + urlEncode(query);
-  char *json = static_cast<char *>(malloc(JSON_BYTES));
-  if (!json) return O_NET_ERROR;
-  size_t len = 0;
+// One MusicBrainz release group search (plain HTTP: no TLS needed). Returns
+// the HTTP status, -1 if stopped.
+int mbSearch(const String &query, int limit, GroupReader &reader) {
+  const String url = "http://musicbrainz.org/ws/2/release-group/?fmt=json&limit=" + String(limit) +
+                     "&query=" + urlEncode(query);
   int status = 0;
   for (int attempt = 0; attempt < 3; attempt++) {
+    if (!nap(MB_INTERVAL_MS - min<uint32_t>(MB_INTERVAL_MS, millis() - lastMbRequest))) return -1;
     lastMbRequest = millis();
-    len = 0;
-    json[0] = 0;
+    reader = GroupReader();
     status = httpGet(url, [&](const uint8_t *d, int n) {
-      const size_t take = min<size_t>(n, JSON_BYTES - 1 - len);
-      memcpy(json + len, d, take);
-      len += take;
-      json[len] = 0;
+      reader.feed(d, n);
       return true;  // read the rest so the connection ends cleanly
     });
     if (status != 503) break;  // busy: MusicBrainz asks clients to slow down
-    if (!nap(3000 * (attempt + 1))) break;
+    if (!nap(3000 * (attempt + 1))) return -1;
   }
-  const char *groups = status == 200 ? strstr(json, "\"release-groups\":[{") : nullptr;
-  const String id = groups ? jsonString(groups, "id") : String();
-  const String title = groups ? jsonString(groups, "title") : String();
-  const char *sc = groups ? strstr(groups, "\"score\":") : nullptr;
-  const int score = sc ? atoi(sc + 8) : 0;
-  free(json);
-  if (status == -1) return O_STOPPED;
-  if (status != 200) {
-    Serial.printf("[art]   search failed: HTTP %d\n", status);
-    return O_NET_ERROR;
-  }
-  if (id.length() != 36 || score < 90) {
-    Serial.printf("[art]   no confident match (best \"%s\", score %d)\n", title.c_str(), score);
-    return writeMarker(key) ? O_NONE : O_NET_ERROR;
-  }
+  return status;
+}
 
-  // 2. Cover: coverartarchive.org redirects to archive.org, which needs HTTPS.
+// Downloads an image to "<key>.jpg" (through "<key>.tmp") and makes its
+// list thumbnail. Returns the HTTP status: 200 saved, -1 stopped, 0 also
+// for card errors; `info` describes what was saved.
+int saveImage(const String &url, uint32_t key, String &info) {
   const String tmp = keyPath(key, "tmp");
   FIL *f = cardNewFil();
   if (!f || f_open(f, cardPath(tmp).c_str(), FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
     cardDeleteFil(f);
-    return O_NET_ERROR;
+    return 0;
   }
   uint32_t bytes = 0;
   bool writeOk = true;
   const uint32_t t0 = millis();
-  status = httpGet("http://coverartarchive.org/release-group/" + id + "/front-250", [&](const uint8_t *d, int n) {
+  int status = httpGet(url, [&](const uint8_t *d, int n) {
     UINT w = 0;
     writeOk = cardWrite(f, d, n, &w) == FR_OK && w == static_cast<UINT>(n);
     bytes += n;
@@ -358,15 +684,82 @@ Outcome fetchAlbum(uint32_t key, const String &album, const String &artist) {
   if (status == 200 && writeOk && bytes) {
     const String jpg = keyPath(key, "jpg");
     f_unlink(cardPath(jpg).c_str());
-    if (f_rename(cardPath(tmp).c_str(), cardPath(jpg).c_str()) != FR_OK) return O_NET_ERROR;
+    if (f_rename(cardPath(tmp).c_str(), cardPath(jpg).c_str()) != FR_OK) return 0;
     CardFile cf;
     uint16_t w = 0, h = 0;
     const char *kind = cf.open(jpg) ? artDescribeImage(cf, 0, cf.size(), w, h) : "?";
-    Serial.printf("[art]   saved \"%s\": %lu bytes, %s %ux%u, %lu ms; free %u\n", title.c_str(), bytes, kind, w, h,
-                  millis() - t0, freeHeap());
-    return O_SAVED;
+    cf.close();
+    const bool thumb = artMakeThumb(cardPath(jpg), thumbPixels) && store.write(key, thumbPixels);
+    if (!thumb) Serial.println("[art]   (no thumbnail: can't decode it?)");
+    info = String(bytes) + " bytes, " + kind + " " + w + "x" + h + ", " + (millis() - t0) + " ms";
+    return 200;
   }
   f_unlink(cardPath(tmp).c_str());
+  return status == 200 ? 0 : status;
+}
+
+Outcome fetchAlbum(uint32_t key, const String &album, const String &artist) {
+  // 1a. Search for the exact names.
+  String query = "releasegroup:" + phrase(searchName(album));
+  query += " AND artist:" + phrase(artist);
+  GroupReader *reader = new (std::nothrow) GroupReader();
+  if (!reader) return O_NET_ERROR;
+  int status = mbSearch(query, 1, *reader);
+  Match best;
+  if (status == 200 && reader->count && reader->matches[0].score >= 90) best = reader->matches[0];
+  // 1b. Nothing: search for the words, then check the names ourselves.
+  // Catches "Pleasure & Pain" (MusicBrainz: "Pleasure + Pain"), "The Bay
+  // City Rollers" ("Bay City Rollers") and names the library cut short.
+  // 1c. Still nothing and the name has a subtitle: search for the part
+  // before it ("You Ain't Heard Nothin' Yet: Jolie's Finest" is "You Ain't
+  // Heard Nothin' Yet!").
+  const bool truncated = maybeTruncated(album, sizeof(AlbumRecord::name));
+  const int colon = album.indexOf(':');
+  // The artist's words are optional (OR), also run together: "The Bay City
+  // Rollers" still finds "Bay City Rollers", "2 Pac" finds "2Pac".
+  // sameArtist() checks the result.
+  String artistWords = comparable(artist, true);
+  if (artistWords.indexOf(' ') > 0) artistWords += " " + noSpaces(artistWords);
+  for (int pass = 0; pass < 2 && status == 200 && best.id.isEmpty(); pass++) {
+    const String words = pass == 0 ? titleQuery(album, truncated)
+                         : colon > 0 ? titleQuery(album.substring(0, colon), false)
+                                     : String();
+    if (words.isEmpty()) continue;
+    query = "releasegroup:(" + words + ") AND artist:(" + artistWords + ")";
+    status = mbSearch(query, MAX_MATCHES, *reader);
+    int bestFit = 0;
+    for (int i = 0; status == 200 && i < reader->count; i++) {
+      const Match &m = reader->matches[i];
+      if (!sameArtist(artist, m.artist)) continue;
+      const int fit = titleFit(album, m.title, truncated);
+      if (fit > bestFit) {
+        bestFit = fit;
+        best = m;
+      }
+    }
+    if (best.id.length()) Serial.printf("[art]   loose match \"%s\" by \"%s\"\n", best.title.c_str(), best.artist.c_str());
+  }
+  const String bestSeen = reader->count ? reader->matches[0].title : String();
+  delete reader;
+  if (status == -1) return O_STOPPED;
+  if (status != 200) {
+    Serial.printf("[art]   search failed: HTTP %d\n", status);
+    return O_NET_ERROR;
+  }
+  const String id = best.id, title = best.title;
+  if (id.length() != 36) {
+    Serial.printf("[art]   no match (closest \"%s\")\n", bestSeen.c_str());
+    return writeMarker(key) ? O_NONE : O_NET_ERROR;
+  }
+
+  // 2. Cover: coverartarchive.org redirects to archive.org, which needs HTTPS.
+  const uint32_t t0 = millis();
+  String info;
+  status = saveImage("http://coverartarchive.org/release-group/" + id + "/front-250", key, info);
+  if (status == 200) {
+    Serial.printf("[art]   saved \"%s\": %s; free %u\n", title.c_str(), info.c_str(), freeHeap());
+    return O_SAVED;
+  }
   if (status == -1) return O_STOPPED;
   if (status == 404) {  // the release group has no front cover
     Serial.printf("[art]   \"%s\" has no cover\n", title.c_str());
@@ -376,11 +769,98 @@ Outcome fetchAlbum(uint32_t key, const String &album, const String &artist) {
   return O_NET_ERROR;
 }
 
+// One Deezer artist search. Returns the HTTP status, -1 if stopped.
+int dzSearch(const String &artist, ArtistReader &reader) {
+  const String url = "http://api.deezer.com/search/artist?limit=" + String(MAX_ARTISTS) + "&q=" + urlEncode(artist);
+  int status = 0;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (!nap(DZ_INTERVAL_MS - min<uint32_t>(DZ_INTERVAL_MS, millis() - lastDzRequest))) return -1;
+    lastDzRequest = millis();
+    reader = ArtistReader();
+    status = httpGet(url, [&](const uint8_t *d, int n) {
+      reader.feed(d, n);
+      return true;
+    });
+    if (status == 200 && !reader.error) break;
+    if (status == 200) status = 429;  // an error answer: over the quota
+    if (!nap(5000 * (attempt + 1))) return -1;
+  }
+  return status;
+}
+
+// An artist's photo: the first search result with the same name (after
+// comparable(), as for albums). Deezer has no photo for some artists; their
+// picture URL then has an empty id ("/images/artist//250x250...").
+Outcome fetchArtist(uint32_t key, const String &artist) {
+  ArtistReader *reader = new (std::nothrow) ArtistReader();
+  if (!reader) return O_NET_ERROR;
+  int status = dzSearch(artist, *reader);
+  String picture, found;
+  for (int i = 0; status == 200 && i < reader->count; i++) {
+    const ArtistMatch &m = reader->matches[i];
+    if (!sameArtist(artist, m.name)) continue;
+    found = m.name;
+    if (m.picture.startsWith("http") && m.picture.indexOf("/artist//") < 0) picture = m.picture;
+    break;
+  }
+  const String closest = reader->count ? reader->matches[0].name : String();
+  delete reader;
+  if (status == -1) return O_STOPPED;
+  if (status != 200) {
+    Serial.printf("[art]   artist search failed: HTTP %d\n", status);
+    return O_NET_ERROR;
+  }
+  if (picture.isEmpty()) {
+    const String why = found.length() ? String("Deezer has none") : "no match (closest \"" + closest + "\")";
+    Serial.printf("[art]   no photo: %s\n", why.c_str());
+    return writeMarker(key) ? O_NONE : O_NET_ERROR;
+  }
+  const uint32_t t0 = millis();
+  String info;
+  status = saveImage(picture, key, info);
+  if (status == 200) {
+    Serial.printf("[art]   saved photo of \"%s\": %s; free %u\n", found.c_str(), info.c_str(), freeHeap());
+    return O_SAVED;
+  }
+  if (status == -1) return O_STOPPED;
+  if (status == 404) return writeMarker(key) ? O_NONE : O_NET_ERROR;
+  Serial.printf("[art]   photo failed: HTTP %d after %lu ms\n", status, millis() - t0);
+  return O_NET_ERROR;
+}
+
+// An artist without a photo (yet) shows the thumbnail of their first album
+// with one, marked as a stand-in; a photo found later replaces it.
+struct StandInStats {
+  uint32_t made = 0, had = 0, noCover = 0;
+};
+StandInStats standIns;
+
+void makeArtistStandIn(const ArtistRecord &ar, LibReader &albums) {
+  const String artist(ar.name, strnlen(ar.name, sizeof(ar.name)));
+  if (placeholder(artist)) return;
+  if (store.read(artistKey(artist.c_str()), thumbPixels)) {
+    standIns.had++;
+    return;
+  }
+  AlbumRecord al;
+  bool made = false;
+  for (uint32_t i = 0; i < ar.albumCount && !stopRequested && !made; i++) {
+    if (!albums.read(ar.firstAlbum + i, &al) || (al.flags & ALBUM_NONE)) continue;
+    const String album(al.name, strnlen(al.name, sizeof(al.name)));
+    if (store.read(albumKey(artist.c_str(), album.c_str()), thumbPixels)) {
+      made = store.write(artistKey(artist.c_str()), thumbPixels, THUMB_STAND_IN);
+    }
+  }
+  if (made) standIns.made++;
+  else standIns.noCover++;
+}
+
 // True if the album already has a cover, or a recent "no cover" marker.
 bool alreadyHandled(uint32_t key) {
   FILINFO info;
   if (f_stat(cardPath(keyPath(key, "jpg")).c_str(), &info) == FR_OK) return true;
   if (f_stat(cardPath(keyPath(key, "no")).c_str(), &info) != FR_OK) return false;
+  if (info.fsize < MARKER_SIZE) return false;  // from an older search
   const time_t now = time(nullptr);
   if (now < 1700000000) return true;  // clock not set yet: can't tell its age
   struct tm t = {};
@@ -390,9 +870,114 @@ bool alreadyHandled(uint32_t key) {
   return difftime(now, mktime(&t)) < MISSING_RETRY_DAYS * 86400.0;
 }
 
+// True if the album (or artist) has its own picture. Makes sure its
+// thumbnail is in the store (no WiFi needed): pictures saved before the
+// store had a "<key>.thm" file, which is moved in, or none.
+bool makeMissingThumb(uint32_t key) {
+  uint8_t flags = 0;
+  if (store.read(key, thumbPixels, &flags) && !(flags & THUMB_STAND_IN)) return true;
+  FILINFO info;
+  const String jpg = keyPath(key, "jpg");
+  if (f_stat(cardPath(jpg).c_str(), &info) != FR_OK) return false;
+  const String thm = artThumbPath(jpg);
+  const uint32_t t0 = millis();
+  const bool moved = artReadThumb(cardPath(thm), thumbPixels);
+  const bool ok = (moved || artMakeThumb(cardPath(jpg), thumbPixels)) && store.write(key, thumbPixels);
+  if (ok && moved) f_unlink(cardPath(thm).c_str());
+  if (!moved) Serial.printf("[art] thumbnail %s: %s, %lu ms\n", jpg.c_str(), ok ? "made" : "failed", millis() - t0);
+  return true;
+}
+
+// ---------------------------------------------------------------- key migration
+// Pictures saved before names were normalized are under legacy keys. Once
+// per library generation (no WiFi), move them: albums and artists of the
+// library (thumbnail, cover/photo and "no picture" marker), then the
+// thumbnails songs look up for their own album (a "none" song's album isn't
+// in the library any more, but its cover may be on the card).
+uint32_t migratedGen = LIB_NONE;
+
+bool moveFile(uint32_t from, uint32_t to, const char *ext) {
+  FILINFO info;
+  if (f_stat(cardPath(keyPath(from, ext)).c_str(), &info) != FR_OK) return false;
+  char bucket[40];
+  snprintf(bucket, sizeof(bucket), ART_DIR "/%02x", static_cast<unsigned>(to >> 24));
+  f_mkdir(cardPath(bucket).c_str());
+  f_unlink(cardPath(keyPath(to, ext)).c_str());
+  return f_rename(cardPath(keyPath(from, ext)).c_str(), cardPath(keyPath(to, ext)).c_str()) == FR_OK;
+}
+
+// True if something was moved.
+bool migrateKey(uint32_t legacy, uint32_t key, bool files) {
+  if (legacy == key || store.read(key, thumbPixels)) return false;
+  uint8_t flags = 0;
+  const bool thumb = store.read(legacy, thumbPixels, &flags) && store.write(key, thumbPixels, flags);
+  bool moved = false;
+  if (files) {
+    moved = moveFile(legacy, key, "jpg");
+    moved = moveFile(legacy, key, "no") || moved;
+  }
+  return thumb || moved;
+}
+
+bool migrateKeys(LibReader &albums, LibReader &artists) {
+  const uint32_t t0 = millis();
+  uint32_t moved = 0;
+  AlbumRecord al;
+  ArtistRecord ar;
+  for (uint32_t i = 0; i < artists.count() && !stopRequested; i++) {
+    vTaskDelay(1);
+    if (!artists.read(i, &ar)) continue;
+    moved += migrateKey(legacyArtistKey(ar.name), artistKey(ar.name), true);
+  }
+  for (uint32_t i = 0; i < albums.count() && !stopRequested; i++) {
+    vTaskDelay(1);
+    if (!albums.read(i, &al) || (al.flags & (ALBUM_NONE | ALBUM_NONE_ALL)) || !artists.read(al.artistId, &ar)) continue;
+    moved += migrateKey(legacyAlbumKey(ar.name, al.name), albumKey(ar.name, al.name), true);
+  }
+  LibReader order, songs;
+  if (order.open(passGen, LF_ARTIST_INDEX, sizeof(uint32_t)) && songs.open(passGen, LF_SONGS, sizeof(SongRecord))) {
+    order.setReadAhead(4096);
+    uint32_t id, last = 0;
+    SongRecord r;
+    for (uint32_t pos = 0; pos < order.count() && !stopRequested; pos++) {
+      if (pos % 16 == 0) vTaskDelay(1);
+      if (!order.read(pos, &id) || !songs.read(id, &r) || !r.album[0]) continue;
+      const char *artist = r.albumArtist[0] ? r.albumArtist : r.artist[0] ? r.artist : "Unknown Artist";
+      const uint32_t key = albumKey(artist, r.album);
+      if (key == last) continue;  // an album's songs are together
+      last = key;
+      if (migrateKey(legacyAlbumKey(artist, r.album), key, false) ||
+          migrateKey(legacyAlbumKey("Various Artists", r.album), albumKey("Various Artists", r.album), false)) {
+        moved++;
+      }
+    }
+  }
+  if (stopRequested) return false;
+  Serial.printf("[art] moved %lu pictures to normalized keys in %lu ms\n", moved, millis() - t0);
+  return true;
+}
+
 // ---------------------------------------------------------------- the pass
 enum PassResult { P_DONE, P_STOPPED, P_NO_WIFI, P_NET, P_BUSY };
 
+PassResult ensureWifi() {
+  if (wifiUp) return P_DONE;
+  if (freeHeap() < MIN_FREE_FOR_WIFI) {
+    Serial.printf("[art] not enough memory for WiFi (%u free)\n", freeHeap());
+    return P_BUSY;
+  }
+  if (!wifiStart()) return stopRequested ? P_STOPPED : P_NO_WIFI;
+  return P_DONE;
+}
+
+void makeBucket(uint32_t key) {
+  char bucket[40];
+  snprintf(bucket, sizeof(bucket), ART_DIR "/%02x", static_cast<unsigned>(key >> 24));
+  f_mkdir(cardPath(bucket).c_str());
+}
+
+// Three steps over one cursor: album covers; stand-ins for artists (an album
+// cover, no WiFi); artist photos.
 PassResult runPass() {
   if (!audioReleaseEngine()) return P_BUSY;  // music started meanwhile
   LibReader albums, artists;
@@ -402,36 +987,63 @@ PassResult runPass() {
   }
   albums.setReadAhead(4096);
   f_mkdir(cardPath(ART_DIR).c_str());
-  const uint32_t total = albums.count();
+  if (!ThumbStore::exists() && !ThumbStore::create(stopRequested)) return stopRequested ? P_STOPPED : P_BUSY;
+  if (migratedGen != passGen) {
+    if (!migrateKeys(albums, artists)) return P_STOPPED;
+    migratedGen = passGen;
+  }
+  const uint32_t nAlbums = albums.count(), nArtists = artists.count();
+  const uint32_t total = nAlbums + 2 * nArtists;
   progressTotal = total;
   uint32_t netErrors = 0, saved = 0, none = 0;
   for (; cursor < total; cursor++) {
     progressDone = cursor;
     if (stopRequested) return P_STOPPED;
+    // Also keeps steps without network waits from starving core 0's idle
+    // task (watchdog).
+    vTaskDelay(pdMS_TO_TICKS(CARD_PAUSE_MS));
     AlbumRecord al;
     ArtistRecord ar;
-    if (!albums.read(cursor, &al) || !al.name[0]) continue;
-    const String album(al.name, strnlen(al.name, sizeof(al.name)));
-    if (placeholder(album)) continue;  // songs without an album tag
-    String artist;
-    if (artists.read(al.artistId, &ar)) artist = String(ar.name, strnlen(ar.name, sizeof(ar.name)));
-    // Without an artist, a search by album name alone matches too many
-    // albums to trust ("Greatest Hits"): skip.
-    if (placeholder(artist)) continue;
-    const uint32_t key = albumKey(artist.c_str(), album.c_str());
-    if (alreadyHandled(key)) continue;
-    if (!wifiUp) {
-      if (freeHeap() < MIN_FREE_FOR_WIFI) {
-        Serial.printf("[art] not enough memory for WiFi (%u free)\n", freeHeap());
-        return P_BUSY;
+    Outcome o;
+    if (cursor < nAlbums) {
+      if (!albums.read(cursor, &al) || !al.name[0] || (al.flags & (ALBUM_NONE | ALBUM_NONE_ALL))) continue;
+      const String album(al.name, strnlen(al.name, sizeof(al.name)));
+      if (placeholder(album)) continue;  // songs without an album tag
+      String artist;
+      if (artists.read(al.artistId, &ar)) artist = String(ar.name, strnlen(ar.name, sizeof(ar.name)));
+      // Without an artist, a search by album name alone matches too many
+      // albums to trust ("Greatest Hits"): skip.
+      if (placeholder(artist)) continue;
+      const uint32_t key = albumKey(artist.c_str(), album.c_str());
+      if (makeMissingThumb(key)) continue;
+      if (alreadyHandled(key)) continue;
+      const PassResult w = ensureWifi();
+      if (w != P_DONE) return w;
+      makeBucket(key);
+      Serial.printf("[art] %lu/%lu \"%s\" by \"%s\"\n", cursor + 1, total, album.c_str(), artist.c_str());
+      o = fetchAlbum(key, album, artist);
+    } else if (cursor < nAlbums + nArtists) {
+      if (cursor == nAlbums) standIns = StandInStats();
+      if (artists.read(cursor - nAlbums, &ar)) makeArtistStandIn(ar, albums);
+      if (cursor + 1 == nAlbums + nArtists) {
+        Serial.printf("[art] artist stand-ins: %lu made, %lu had a picture, %lu without an album cover\n",
+                      standIns.made, standIns.had, standIns.noCover);
       }
-      if (!wifiStart()) return stopRequested ? P_STOPPED : P_NO_WIFI;
+      continue;
+    } else {
+      if (!artists.read(cursor - nAlbums - nArtists, &ar)) continue;
+      const String artist(ar.name, strnlen(ar.name, sizeof(ar.name)));
+      if (placeholder(artist) || artist.equalsIgnoreCase("Various Artists")) continue;
+      const uint32_t key = artistKey(artist.c_str());
+      if (makeMissingThumb(key)) continue;
+      if (alreadyHandled(key)) continue;
+      const PassResult w = ensureWifi();
+      if (w != P_DONE) return w;
+      makeBucket(key);
+      Serial.printf("[art] %lu/%lu photo of \"%s\"\n", cursor + 1, total, artist.c_str());
+      o = fetchArtist(key, artist);
     }
-    char bucket[40];
-    snprintf(bucket, sizeof(bucket), ART_DIR "/%02x", static_cast<unsigned>(key >> 24));
-    f_mkdir(cardPath(bucket).c_str());
-    Serial.printf("[art] %lu/%lu \"%s\" by \"%s\"\n", cursor + 1, total, album.c_str(), artist.c_str());
-    switch (fetchAlbum(key, album, artist)) {
+    switch (o) {
       case O_SAVED: saved++; netErrors = 0; break;
       case O_NONE: none++; netErrors = 0; break;
       case O_STOPPED: return P_STOPPED;
@@ -441,17 +1053,20 @@ PassResult runPass() {
     }
   }
   progressDone = total;
-  Serial.printf("[art] pass done: %lu covers saved, %lu without one\n", saved, none);
+  Serial.printf("[art] pass done: %lu pictures saved, %lu without one\n", saved, none);
   return P_DONE;
 }
 
 void fetchTask(void *) {
   const uint32_t t0 = millis();
   const PassResult r = runPass();
+  store.close();
   wifiStop();
   static const char *const names[] = {"done", "stopped", "no WiFi", "network errors", "busy"};
   Serial.printf("[art] pass ended (%s) after %lu s; free %u\n", names[r], (millis() - t0) / 1000, freeHeap());
-  if (r == P_DONE) finishedGen = passGen;
+  if (r == P_DONE && albumsSkipped) cursor = 0;  // albums still to do
+  else if (r == P_DONE) finishedGen = passGen;
+  if (r == P_DONE) albumsSkipped = false;
   if (r == P_NO_WIFI || r == P_NET) retryAt = millis() + RETRY_AFTER_MS;
   task = nullptr;
   vTaskDelete(nullptr);
@@ -468,11 +1083,21 @@ bool startPass() {
   }
   stopRequested = false;
   progressDone = cursor;
-  progressTotal = Catalog::albumCount();
+  progressTotal = Catalog::albumCount() + 2 * Catalog::artistCount();
   return xTaskCreatePinnedToCore(fetchTask, "artfetch", TASK_STACK, nullptr, 1, &task, 0) == pdPASS;
 }
 
 }  // namespace
+
+uint32_t artAlbumKey(const char *albumArtist, const char *album) {
+  if (!album || !album[0]) return 0;
+  return albumKey(albumArtist ? albumArtist : "", album);
+}
+
+uint32_t artArtistKey(const char *artist) {
+  if (!artist || placeholder(artist)) return 0;
+  return artistKey(artist);
+}
 
 String artCoverPath(const char *albumArtist, const char *album) {
   if (!album || !album[0]) return "";
@@ -508,6 +1133,14 @@ void artFetchNow() {
   finishedGen = LIB_NONE;
   retryAt = 0;
   if (!startPass()) Serial.println("[art] can't start (art off for this card, no WiFi saved, or library busy)");
+}
+
+void artFetchArtistsNow() {
+  artFetchStop();
+  cursorGen = Catalog::generation();
+  cursor = Catalog::albumCount();
+  albumsSkipped = true;
+  artFetchNow();
 }
 
 void artFetchStop() {

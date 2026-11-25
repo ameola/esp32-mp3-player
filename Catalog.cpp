@@ -5,7 +5,7 @@
 namespace Catalog {
 
 static LibReader songs, titles, folders, names;          // always open
-static LibReader artistIdx, artists, albums, albumIdx;   // opened on first use
+static LibReader artistIdx, artists, albums, albumIdx, noneIdx;  // opened on first use
 static uint32_t gen_ = LIB_NONE;
 static JumpTable jumps[3];
 static bool jumpLoaded[3];
@@ -31,6 +31,7 @@ void close() {
   artists.close();
   albums.close();
   albumIdx.close();
+  noneIdx.close();
   gen_ = LIB_NONE;
   jumpLoaded[0] = jumpLoaded[1] = jumpLoaded[2] = false;
 }
@@ -62,6 +63,7 @@ bool song(uint32_t id, Track &out) {
   out.title = r.title;
   out.artist = r.artist;
   out.album = r.album;
+  out.albumArtist = r.albumArtist;
   out.track = r.track;
   out.disc = r.disc;
   out.year = r.year;
@@ -96,6 +98,10 @@ bool titleSong(uint32_t pos, uint32_t &id) {
 
 bool artistSong(uint32_t pos, uint32_t &id) {
   return ensure(artistIdx, LF_ARTIST_INDEX, sizeof(uint32_t)) && artistIdx.read(pos, &id);
+}
+
+bool noneSong(uint32_t pos, uint32_t &id) {
+  return ensure(noneIdx, LF_NONE_INDEX, sizeof(uint32_t)) && noneIdx.read(pos, &id);
 }
 
 // ---------------------------------------------------------------- Artists, albums, folders

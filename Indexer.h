@@ -43,6 +43,8 @@ struct IndexStats {
   uint32_t resumedAt = 0;
   uint32_t gen = 0;              // live generation afterwards
   uint32_t songs = 0, folders = 0, artists = 0, albums = 0;
+  uint32_t duplicates = 0;   // songs left out of the indexes (another copy is listed)
+  uint32_t noneSongs = 0;    // songs in "none" albums
   uint32_t reused = 0, tagged = 0;
   uint32_t fastOpens = 0, pathOpens = 0, failedOpens = 0;
   uint32_t checkMs = 0, walkMs = 0, songsMs = 0, sortMs = 0, commitMs = 0;

@@ -12,6 +12,7 @@ struct Track {
   String title;             // display text (file name if untagged)
   String artist;            // empty when missing
   String album;
+  String albumArtist;       // empty when missing
   uint16_t track = 0;
   uint8_t disc = 0;
   uint16_t year = 0;
@@ -36,6 +37,7 @@ String songPath(uint32_t id);  // Arduino-style path on the card
 // Song ids at positions of the sorted indexes.
 bool titleSong(uint32_t pos, uint32_t &id);   // title.idx: all songs by title
 bool artistSong(uint32_t pos, uint32_t &id);  // artist.idx: by artist/album/track
+bool noneSong(uint32_t pos, uint32_t &id);    // none.idx: every "none" album's songs by title
 
 uint32_t artistCount();
 bool artist(uint32_t id, ArtistRecord &out);

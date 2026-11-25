@@ -248,7 +248,7 @@ static void handleTouch(TouchPhase phase, int16_t x, int16_t y) {
 
 // Debug aid: inject touches over Serial: "tap x y", "drag x y1 y2 [ms]",
 // "audiocpu" (time spent decoding over 3 s), "artscan" (album art survey),
-// "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass),
+// "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "libdump" (every song's cleaned tags and path),
 // "mem" (free memory after each startup step, and now),
 // "hold x y ms". Prints the time taken and free heap afterwards.
 static void serviceSerialCommands() {
@@ -300,6 +300,18 @@ static void serviceSerialCommands() {
         delay(10);
       }
       handleTouch(TOUCH_UP, x, y);
+    } else if (line == "libdump") {  // every song: id, tags, path (tab-separated)
+      Track t;
+      const uint32_t n = Catalog::songCount();
+      Serial.printf("[dump] begin %lu\n", n);
+      for (uint32_t id = 0; id < n; id++) {
+        if (!Catalog::song(id, t)) continue;
+        Serial.printf("[dump]\t%lu\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%lu\t%s\n", id, t.title.c_str(), t.artist.c_str(),
+                      t.album.c_str(), t.albumArtist.c_str(), t.track, t.disc, t.year, t.durationMs,
+                      Catalog::songPath(id).c_str());
+        if (id % 50 == 0) delay(1);
+      }
+      Serial.println("[dump] end");
     } else if (line == "mem") {
       Serial.print(memLog);
       memStep("now", false);
@@ -308,6 +320,8 @@ static void serviceSerialCommands() {
       artFetchStop();
       appState = WIFI_SETUP;
       wifiSetupBegin();
+    } else if (line == "artartists") {  // test: a pass of the artist steps only
+      artFetchArtistsNow();
     } else if (line == "artfetch") {  // start an album art pass now
       artFetchNow();
     } else if (line == "artstop") {

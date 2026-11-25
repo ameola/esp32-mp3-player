@@ -9,6 +9,7 @@
 
 #include "CardFile.h"
 #include "ExtSort.h"
+#include "LibClean.h"
 #include "LibStore.h"
 #include "Library.h"
 #include "Tags.h"
@@ -33,7 +34,6 @@
 
 static const char kVarious[] = "Various Artists";
 static const char kUnknownArtist[] = "Unknown Artist";
-static const char kUnknownAlbum[] = "Unknown Album";
 
 // One entry per song from the walk (temp file).
 struct __attribute__((packed)) SkelRecord {
@@ -895,29 +895,49 @@ static void titleKey(SortRec &k, const SongRecord &r, uint32_t id) {
   k.id = id;
 }
 
-// artist(20: bucket, name prefix, name hash) | album(16: prefix, hash) |
-// disc | track | title prefix. Equal first 20 bytes = same artist; equal
-// first 36 = same album.
+static uint32_t fnv(const char *s) {
+  return fnv1a(s, strlen(s), false);
+}
+
+// Copies the first n bytes of a normalized name (LibClean), zero-padded.
+static void normCopy(uint8_t *dst, size_t n, const String &norm) {
+  memset(dst, 0, n);
+  memcpy(dst, norm.c_str(), std::min(n, norm.length()));
+}
+
+// The name an artist key groups by: album artist, else track artist;
+// "Various Artists" for a compilation.
+static const char *groupArtist(const SongRecord &r, bool various) {
+  return various ? kVarious : (r.albumArtist[0] ? r.albumArtist : r.artist);
+}
+
+// Stage 1 of the artist order (see regroup()):
+// artist(20: bucket, normalized name prefix, normalized name hash) |
+// album(16: normalized prefix, hash) | disc | track | title's first letter |
+// hash of the artist name as spelled. Names are normalized (LibClean) so
+// "KoRn" and "Korn", "The Prodigy" and "Prodigy" group as one artist, and
+// "X" with its discs as one album. Equal first 20 bytes = same artist;
+// equal first 36 = same album.
 static void artistKey(SortRec &k, const SongRecord &r, uint32_t id, bool various) {
   memset(&k, 0, sizeof(k));
-  const char *name = various ? kVarious : (r.albumArtist[0] ? r.albumArtist : r.artist);
+  const char *name = groupArtist(r, various);
   if (name[0]) {
-    const char *sortName = stripThe(name);
-    k.key[0] = libBucket(sortName);
-    lowerCopy(k.key + 1, 15, sortName);
+    k.key[0] = libBucket(stripThe(name));
+    normCopy(k.key + 1, 15, libNormName(name, true));
   } else {
     k.key[0] = 0xFF;  // unknown artist sorts last
   }
-  putBe32(k.key + 16, hashLower(name));
+  putBe32(k.key + 16, name[0] ? libNormHash(name, true) : 0);
   if (r.album[0]) {
-    lowerCopy(k.key + 20, 12, r.album);
+    normCopy(k.key + 20, 12, libNormName(r.album, false));
+    putBe32(k.key + 32, libNormHash(r.album, false));
   } else {
-    memset(k.key + 20, 0xFF, 12);  // unknown album sorts last within the artist
+    memset(k.key + 20, 0xFF, 16);  // no album: the artist's "none" album
   }
-  putBe32(k.key + 32, hashLower(r.album));
   k.key[36] = r.disc;
   putBe16(k.key + 37, r.track);
-  lowerCopy(k.key + 39, 5, r.title);
+  k.key[39] = tolower(static_cast<unsigned char>(r.title[0]));
+  putBe32(k.key + 40, fnv(name));
   k.id = id;
 }
 
@@ -972,8 +992,8 @@ static bool feedSorters(uint32_t gen, const IndexOptions &o, ExtSort &titles, Ex
       if (!r.album[0] || r.albumArtist[0]) {
         continue;
       }
-      const uint32_t album = hashLower(r.album);
-      const uint32_t artist = hashLower(r.artist);
+      const uint32_t album = libNormHash(r.album, false);
+      const uint32_t artist = libNormHash(r.artist, true);
       auto it = std::find_if(albums.begin(), albums.end(),
                              [&](const AlbumArtists &a) { return a.album == album; });
       if (it == albums.end()) {
@@ -989,7 +1009,7 @@ static bool feedSorters(uint32_t gen, const IndexOptions &o, ExtSort &titles, Ex
       readUs += micros() - t0;
       bool various = false;
       if (r.album[0] && !r.albumArtist[0]) {
-        const uint32_t album = hashLower(r.album);
+        const uint32_t album = libNormHash(r.album, false);
         for (const AlbumArtists &a : albums) {
           if (a.album == album) {
             various = a.various;
@@ -1021,41 +1041,181 @@ static bool feedSorters(uint32_t gen, const IndexOptions &o, ExtSort &titles, Ex
   return titles.finish() && artists.finish();
 }
 
-// Also saves the sorted records as title.keys for the next build.
-static bool writeTitleIndex(uint32_t gen, KeyStream &titles, IndexStats &st) {
+static bool isFlagged(const std::vector<uint8_t> &bits, uint32_t i) {
+  return i / 8 < bits.size() && (bits[i / 8] >> (i % 8)) & 1;
+}
+static void setFlag(std::vector<uint8_t> &bits, uint32_t i) {
+  if (i / 8 < bits.size()) bits[i / 8] |= 1 << (i % 8);
+}
+
+// Also saves the sorted records as title.keys for the next build (all of
+// them: the next build's patch needs every song).
+//
+// Duplicates: copies of a song have the same title, so they come together in
+// title order. Within a run of equal title keys, songs with the same title
+// and artist (normalized) and lengths within 2 s are one song; the copy kept
+// is the one in the folder with the most songs (most likely its album), then
+// one with an album and a track number, then the first. The others are
+// marked in `dup` and left out of every index.
+static bool writeTitleIndex(uint32_t gen, KeyStream &titles, IndexStats &st, std::vector<uint8_t> &dup) {
   LibWriter idx, keys;
+  LibReader songs, folders;
   JumpBuilder jump;
-  SortRec k;
   if (!idx.create(gen, LF_TITLE_INDEX, sizeof(uint32_t), sizeof(JumpTable)) ||
-      !keys.create(gen, LF_TITLE_KEYS, sizeof(SortRec))) {
+      !keys.create(gen, LF_TITLE_KEYS, sizeof(SortRec)) || !songs.open(gen, LF_SONGS, sizeof(SongRecord)) ||
+      !folders.open(gen, LF_FOLDERS, sizeof(FolderRecord))) {
     return false;
   }
-  while (titles.next(k)) {
-    jump.add(k.key[0], idx.count());
-    if (!idx.append(&k.id) || !keys.append(&k)) {
-      return false;
+  struct Copy {
+    uint32_t id, title, artist, ms, score;
+  };
+  std::vector<SortRec> run;
+  std::vector<Copy> copies;
+  std::vector<uint32_t> kept;
+  auto flush = [&]() -> bool {
+    if (run.size() > 1) {
+      copies.clear();
+      SongRecord r;
+      FolderRecord f;
+      for (const SortRec &k : run) {
+        if (!songs.read(k.id, &r)) return false;
+        const uint32_t inFolder = folders.read(r.folderId, &f) ? std::min<uint32_t>(f.songCount, 0xFFFF) : 0;
+        copies.push_back({k.id, libNormHash(r.title, true), libNormHash(r.artist, true), r.durationMs,
+                          inFolder << 2 | (r.album[0] ? 2u : 0u) | (r.track ? 1u : 0u)});
+      }
+      std::stable_sort(copies.begin(), copies.end(), [](const Copy &a, const Copy &b) { return a.score > b.score; });
+      kept.clear();
+      for (size_t i = 0; i < copies.size(); i++) {
+        bool same = false;
+        for (uint32_t j : kept) {
+          const Copy &a = copies[i], &b = copies[j];
+          const uint32_t diff = a.ms > b.ms ? a.ms - b.ms : b.ms - a.ms;
+          same = same || (a.title == b.title && a.artist == b.artist && diff <= 2000);
+        }
+        if (same) {
+          setFlag(dup, copies[i].id);
+          st.duplicates++;
+        } else {
+          kept.push_back(i);
+        }
+      }
     }
+    for (const SortRec &k : run) {
+      if (isFlagged(dup, k.id)) continue;
+      jump.add(k.key[0], idx.count());
+      if (!idx.append(&k.id)) return false;
+    }
+    run.clear();
+    return true;
+  };
+  SortRec k;
+  while (titles.next(k)) {
+    if (!keys.append(&k)) return false;
+    if (!run.empty() && memcmp(run[0].key, k.key, 40) != 0 && !flush()) return false;  // 40: bucket + title
+    run.push_back(k);
   }
+  if (!flush()) return false;
   jump.finish(idx.count());
   return idx.finish(&jump.table) && keys.finish();
 }
 
-// Also saves the sorted records as artist.keys for the next build.
-static bool writeArtists(uint32_t gen, KeyStream &artistSort, ExtSort &albumSort, IndexStats &st) {
+// Stage 2 of the artist order. Reads the stage 1 keys in order (an artist's
+// songs together, each album's together), saves them as artist.keys for the
+// next build's patch, and passes every song that isn't a duplicate on to
+// `out`, the final order:
+// - songs of an album with more than NONE_MAX_SONGS songs keep their key;
+// - songs of smaller albums and without an album get key[20] = 0xFF and
+//   their title after it: the artist's "none" album, last, by title.
+// Also picks each artist's name as spelled most often (artistRep: one song
+// id per artist, in order).
+static bool regroup(uint32_t gen, KeyStream &in, ExtSort &out, const std::vector<uint8_t> &dup,
+                    std::vector<uint32_t> &artistRep) {
+  LibWriter keys;
   LibReader songs;
-  LibWriter artists, albums, artistIdx, keys;
+  if (!keys.create(gen, LF_ARTIST_KEYS, sizeof(SortRec)) || !songs.open(gen, LF_SONGS, sizeof(SongRecord))) {
+    return false;
+  }
+  struct Spelling {
+    uint32_t hash, count, id;
+  };
+  std::vector<Spelling> spellings;
+  SortRec held[NONE_MAX_SONGS + 1];
+  int heldCount = 0;
+  bool bigAlbum = false;
+  uint8_t curArtist[20], curAlbum[36];
+  bool have = false, ok = true;
+  SongRecord r;
+  auto toNone = [&](SortRec k) {
+    if (!songs.read(k.id, &r)) return false;
+    k.key[20] = 0xFF;
+    lowerCopy(k.key + 21, sizeof(k.key) - 21, r.title);
+    return out.add(k);
+  };
+  auto flushAlbum = [&]() {
+    for (int i = 0; i < heldCount; i++) ok = ok && toNone(held[i]);
+    heldCount = 0;
+    bigAlbum = false;
+  };
+  auto flushArtist = [&]() {
+    const Spelling *best = &spellings[0];
+    for (const Spelling &s : spellings) {
+      if (s.count > best->count) best = &s;
+    }
+    artistRep.push_back(best->id);
+    spellings.clear();
+  };
+  SortRec k;
+  while (ok && in.next(k)) {
+    ok = keys.append(&k);
+    if (isFlagged(dup, k.id)) continue;
+    const bool newArtist = !have || memcmp(k.key, curArtist, sizeof(curArtist)) != 0;
+    const bool newAlbum = newArtist || memcmp(k.key, curAlbum, sizeof(curAlbum)) != 0;
+    if (have && newAlbum) flushAlbum();
+    if (have && newArtist) flushArtist();
+    memcpy(curArtist, k.key, sizeof(curArtist));
+    memcpy(curAlbum, k.key, sizeof(curAlbum));
+    have = true;
+    const uint32_t spelling = getBe32(k.key + 40);
+    auto it = std::find_if(spellings.begin(), spellings.end(), [&](const Spelling &s) { return s.hash == spelling; });
+    if (it == spellings.end()) spellings.push_back({spelling, 1, k.id});
+    else it->count++;
+    if (k.key[20] == 0xFF) {  // no album
+      ok = ok && toNone(k);
+    } else if (bigAlbum) {
+      ok = ok && out.add(k);
+    } else {
+      held[heldCount++] = k;
+      if (heldCount > NONE_MAX_SONGS) {
+        bigAlbum = true;
+        for (int i = 0; i < heldCount; i++) ok = ok && out.add(held[i]);
+        heldCount = 0;
+      }
+    }
+  }
+  if (have) {
+    flushAlbum();
+    flushArtist();
+  }
+  return ok && keys.finish() && out.finish();
+}
+
+// Artists, albums and artist.idx from the final artist order (regroup()).
+// Marks the songs of "none" albums in noneBits, and adds the Albums tab's
+// "none" album (over none.idx) at the end.
+static bool writeArtists(uint32_t gen, KeyStream &artistSort, ExtSort &albumSort, IndexStats &st,
+                         const std::vector<uint32_t> &artistRep, std::vector<uint8_t> &noneBits) {
+  LibReader songs;
+  LibWriter artists, albums, artistIdx;
   if (!songs.open(gen, LF_SONGS, sizeof(SongRecord)) ||
       !artists.create(gen, LF_ARTISTS, sizeof(ArtistRecord), sizeof(JumpTable)) ||
       !albums.create(gen, LF_ALBUMS, sizeof(AlbumRecord)) ||
-      !artistIdx.create(gen, LF_ARTIST_INDEX, sizeof(uint32_t)) ||
-      !keys.create(gen, LF_ARTIST_KEYS, sizeof(SortRec))) {
+      !artistIdx.create(gen, LF_ARTIST_INDEX, sizeof(uint32_t))) {
     return false;
   }
-  const uint32_t variousHash = hashLower(kVarious);
+  const uint32_t variousHash = libNormHash(kVarious, true);
   JumpBuilder jump;
   ArtistRecord artist = {};
   AlbumRecord album = {};
-  bool albumUnknown = false;
   uint8_t curArtist[20];
   uint8_t curAlbum[36];
   bool have = false;
@@ -1065,16 +1225,20 @@ static bool writeArtists(uint32_t gen, KeyStream &artistSort, ExtSort &albumSort
 
   auto flushAlbum = [&]() {
     SortRec ak;
-    albumKey(ak, album, artist.name, albums.count(), albumUnknown);
-    ok = ok && albumSort.add(ak) && albums.append(&album);
+    albumKey(ak, album, artist.name, albums.count(), false);
+    // An artist's "none" album is on their page, not in the Albums tab.
+    ok = ok && ((album.flags & ALBUM_NONE) || albumSort.add(ak)) && albums.append(&album);
     artist.albumCount++;
   };
+  auto isNone = [](const uint8_t *key) { return key[20] == 0xFF; };
   auto flushArtist = [&]() { ok = ok && artists.append(&artist); };
 
   uint32_t pos = 0;
   while (ok && artistSort.next(k)) {
     const bool newArtist = !have || memcmp(k.key, curArtist, sizeof(curArtist)) != 0;
-    const bool newAlbum = newArtist || memcmp(k.key, curAlbum, sizeof(curAlbum)) != 0;
+    // A "none" album's keys differ after byte 20 (titles): one album.
+    const bool newAlbum = newArtist || (!(isNone(k.key) && isNone(curAlbum)) &&
+                                        memcmp(k.key, curAlbum, sizeof(curAlbum)) != 0);
     if (have && newAlbum) {
       flushAlbum();
     }
@@ -1086,9 +1250,13 @@ static bool writeArtists(uint32_t gen, KeyStream &artistSort, ExtSort &albumSort
     }
     if (newArtist) {
       artist = {};
+      // The name as spelled most often (regroup()).
+      SongRecord rep;
+      const bool haveRep = artists.count() < artistRep.size() && songs.read(artistRep[artists.count()], &rep);
+      const SongRecord &named = haveRep ? rep : r;
       const char *name = getBe32(k.key + 16) == variousHash && k.key[0] != 0xFF
                            ? kVarious
-                           : (r.albumArtist[0] ? r.albumArtist : r.artist);
+                           : (named.albumArtist[0] ? named.albumArtist : named.artist);
       libCopyField(artist.name, sizeof(artist.name), name[0] ? String(name) : String(kUnknownArtist));
       artist.firstAlbum = albums.count();
       artist.firstSongPos = pos;
@@ -1097,14 +1265,22 @@ static bool writeArtists(uint32_t gen, KeyStream &artistSort, ExtSort &albumSort
     }
     if (newAlbum) {
       album = {};
-      albumUnknown = !r.album[0];
-      libCopyField(album.name, sizeof(album.name), albumUnknown ? String(kUnknownAlbum) : String(r.album));
+      if (isNone(k.key)) {
+        libCopyField(album.name, sizeof(album.name), NONE_ALBUM_NAME);
+        album.flags = ALBUM_NONE;
+      } else {
+        libCopyField(album.name, sizeof(album.name), String(r.album));
+        album.year = r.year;
+      }
       album.artistId = artists.count();  // id the current artist will get
-      album.year = r.year;
       album.firstSongPos = pos;
       memcpy(curAlbum, k.key, sizeof(curAlbum));
     }
-    ok = ok && artistIdx.append(&k.id) && keys.append(&k);
+    if (isNone(k.key)) {
+      setFlag(noneBits, k.id);
+      st.noneSongs++;
+    }
+    ok = ok && artistIdx.append(&k.id);
     artist.songCount++;
     album.songCount++;
     pos++;
@@ -1114,11 +1290,36 @@ static bool writeArtists(uint32_t gen, KeyStream &artistSort, ExtSort &albumSort
     flushAlbum();
     flushArtist();
   }
+  if (ok && st.noneSongs) {  // the Albums tab's "none": every artist's, by title (none.idx)
+    album = {};
+    libCopyField(album.name, sizeof(album.name), NONE_ALBUM_NAME);
+    album.artistId = LIB_NONE;
+    album.flags = ALBUM_NONE_ALL;
+    album.songCount = st.noneSongs;
+    SortRec ak;
+    albumKey(ak, album, "", albums.count(), false);
+    ok = albumSort.add(ak) && albums.append(&album);
+  }
   jump.finish(artists.count());
   st.artists = artists.count();
   st.albums = albums.count();
-  return ok && artists.finish(&jump.table) && albums.finish() && artistIdx.finish() &&
-         keys.finish() && albumSort.finish();
+  return ok && artists.finish(&jump.table) && albums.finish() && artistIdx.finish() && albumSort.finish();
+}
+
+// none.idx: the songs marked in noneBits, in title order.
+static bool writeNoneIndex(uint32_t gen, const std::vector<uint8_t> &noneBits) {
+  LibReader titles;
+  LibWriter idx;
+  if (!titles.open(gen, LF_TITLE_INDEX, sizeof(uint32_t)) || !idx.create(gen, LF_NONE_INDEX, sizeof(uint32_t))) {
+    return false;
+  }
+  titles.setReadAhead(4096);
+  uint32_t id;
+  for (uint32_t pos = 0; pos < titles.count(); pos++) {
+    if (!titles.read(pos, &id)) return false;
+    if (isFlagged(noneBits, id) && !idx.append(&id)) return false;
+  }
+  return idx.finish();
 }
 
 static bool writeAlbumIndex(uint32_t gen, ExtSort &albumSort, IndexStats &st) {
@@ -1271,10 +1472,13 @@ static bool sortAndGroup(uint32_t gen, const IndexOptions &o, IndexStats &st, ui
   st.feedMs = millis() - t;
   report(o, "Writing indexes", 0, 0);
   t = millis();
+  std::vector<uint8_t> dup((st.songs + 7) / 8), noneBits((st.songs + 7) / 8);
+  std::vector<uint32_t> artistRep;
+  st.duplicates = st.noneSongs = 0;
   KeysMerge titleMerge(oldTitleKeys, kept, titles, true);
-  if (patch ? !writeTitleIndex(gen, titleMerge, st) || titleMerge.failed() ||
+  if (patch ? !writeTitleIndex(gen, titleMerge, st, dup) || titleMerge.failed() ||
                 titleMerge.emitted() != st.songs
-            : !writeTitleIndex(gen, titles, st)) {
+            : !writeTitleIndex(gen, titles, st, dup)) {
     st.error = "sort: title index failed";
     return false;
   }
@@ -1283,21 +1487,34 @@ static bool sortAndGroup(uint32_t gen, const IndexOptions &o, IndexStats &st, ui
   oldTitleKeys.close();
   st.titleIdxMs = millis() - t;
   t = millis();
+  // Stage 2 (regroup) into a third sorter, in the title sorter's memory.
+  ExtSort grouped;
   KeysMerge artistMerge(oldArtistKeys, kept, artists, false);
-  if (!albums.begin(tempPath(gen, "sort-album.tmp"), ALBUM_SORT_BUFFER) ||
-      (patch ? !writeArtists(gen, artistMerge, albums, st) || artistMerge.failed() ||
+  if (!grouped.begin(tempPath(gen, "sort-group.tmp"), st.sortBufferBytes, st.songs) ||
+      (patch ? !regroup(gen, artistMerge, grouped, dup, artistRep) || artistMerge.failed() ||
                  artistMerge.emitted() != st.songs
-             : !writeArtists(gen, artists, albums, st))) {
-    st.error = "sort: artist index failed";
+             : !regroup(gen, artists, grouped, dup, artistRep))) {
+    st.error = "sort: grouping failed";
     return false;
   }
   st.sortRuns += artists.runCount();
   artists.end();
   oldArtistKeys.close();
+  if (!albums.begin(tempPath(gen, "sort-album.tmp"), ALBUM_SORT_BUFFER) ||
+      !writeArtists(gen, grouped, albums, st, artistRep, noneBits)) {
+    st.error = "sort: artist index failed";
+    return false;
+  }
+  st.sortRuns += grouped.runCount();
+  grouped.end();
   st.artistIdxMs = millis() - t;
   t = millis();
   if (!writeAlbumIndex(gen, albums, st)) {
     st.error = "sort: album index failed";
+    return false;
+  }
+  if (!writeNoneIndex(gen, noneBits)) {
+    st.error = "sort: none index failed";
     return false;
   }
   st.albumIdxMs = millis() - t;
