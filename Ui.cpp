@@ -11,6 +11,7 @@
 #include "LibStore.h"
 #include "Text.h"
 #include "CardSettings.h"
+#include "Keyboard.h"
 #include "UiFont.h"
 #include "UiTheme.h"
 #include "WifiSetup.h"
@@ -35,6 +36,7 @@ enum ListKind : uint8_t {
   L_SETTINGS,       // the Settings tab: its groups
   L_SETTINGS_GROUP, // param: SettingGroup. Its settings
   L_SETTING_CHOICE, // param: SettingId. Its choices
+  L_SEARCH,         // search results (searchHits)
 };
 
 enum RowKind : uint8_t { R_NONE, R_SONG, R_ARTIST, R_ALBUM, R_ALL_SONGS, R_FOLDER, R_SETTING,
@@ -98,6 +100,7 @@ enum CtxKind : uint8_t {
   CTX_ARTIST_IDX,  // positions in artist.idx (an artist's or album's songs)
   CTX_SONG_IDS,    // consecutive song ids (a folder's songs)
   CTX_NONE_IDX,    // positions in none.idx (the Albums tab's "none")
+  CTX_SEARCH,      // song hits of the last search
 };
 
 struct PlayContext {
@@ -111,6 +114,14 @@ static int32_t playIndex = -1;  // index of the playing song in playCtx
 static Track current;           // the playing song
 static String currentPath;
 
+// The last search's results: artists, then albums, then songs.
+struct SearchHit {
+  uint8_t kind;  // R_ARTIST, R_ALBUM, R_SONG
+  uint32_t id;
+};
+static std::vector<SearchHit> searchHits;
+static uint32_t searchSongStart = 0;  // index of the first song hit
+
 static bool ctxSong(const PlayContext &c, uint32_t i, uint32_t &id) {
   if (i >= c.count) {
     return false;
@@ -120,6 +131,10 @@ static bool ctxSong(const PlayContext &c, uint32_t i, uint32_t &id) {
     case CTX_ARTIST_IDX: return Catalog::artistSong(c.start + i, id);
     case CTX_SONG_IDS: id = c.start + i; return true;
     case CTX_NONE_IDX: return Catalog::noneSong(c.start + i, id);
+    case CTX_SEARCH:
+      if (c.start + i >= searchHits.size()) return false;
+      id = searchHits[c.start + i].id;
+      return true;
     default: return false;
   }
 }
@@ -382,6 +397,9 @@ static PlayContext levelContext(const Level &l) {
     case L_FOLDER:
       if (Catalog::folder(l.param, f)) c = {CTX_SONG_IDS, f.firstSong, f.songCount};
       break;
+    case L_SEARCH:
+      c = {CTX_SEARCH, searchSongStart, static_cast<uint32_t>(searchHits.size()) - searchSongStart};
+      break;
     default:
       break;
   }
@@ -399,6 +417,7 @@ static bool hasHero(const Level &l) {
 static uint32_t songRowOffset(const Level &l) {
   FolderRecord f;
   if (l.kind == L_ALBUM_SONGS) return HERO_ROWS;
+  if (l.kind == L_SEARCH) return searchSongStart;
   return (l.kind == L_FOLDER && Catalog::folder(l.param, f)) ? f.childCount : 0;
 }
 
@@ -417,6 +436,7 @@ static int32_t levelCount(const Level &l) {
     case L_SETTINGS:
     case L_SETTINGS_GROUP:
     case L_SETTING_CHOICE: return settingsCount(l);
+    case L_SEARCH: return searchHits.size();
   }
   return 0;
 }
@@ -541,6 +561,24 @@ static bool levelRow(const Level &l, uint32_t i, Row &row) {
     case L_SETTINGS_GROUP:
     case L_SETTING_CHOICE:
       return settingsRow(l, i, row);
+    case L_SEARCH: {
+      if (i >= searchHits.size()) return false;
+      const SearchHit &h = searchHits[i];
+      if (h.kind == R_SONG) return songRow(h.id, false, row);
+      if (h.kind == R_ARTIST) {
+        Level artists;
+        artists.kind = L_ARTISTS;
+        return levelRow(artists, h.id, row);
+      }
+      if (!Catalog::album(h.id, al)) return false;  // R_ALBUM
+      row.kind = R_ALBUM;
+      row.id = h.id;
+      row.line1 = al.name;
+      row.line2 = Catalog::artist(al.artistId, a) ? String(a.name) : String("");
+      row.art = artAlbumKey(row.line2.c_str(), al.name);
+      if (al.year) row.line2 += ", " + String(al.year);
+      return true;
+    }
     default: {  // song lists
       uint32_t songId;
       // Track numbers in an album, not in a "none" album (by title).
@@ -677,6 +715,7 @@ static String libraryStatus;
 static int lastProgressPx = -1;
 static int32_t lastTimeShown = -1;  // elapsed seconds currently on screen
 static uint8_t wifiShown = 0xFF;    // WiFi state in the header (see wifiState())
+static int16_t searchIconX = -1;  // the header's search icon, -1 when not shown
 
 // Centred text with its top near y: size 2 is a title, size 1 small text.
 static void drawCenteredText(const String &text, int16_t cx, int16_t y, uint8_t size, uint16_t color) {
@@ -758,6 +797,12 @@ static void drawHeader() {
   const bool counted = l.kind == L_SONGS || l.kind == L_ARTISTS || l.kind == L_ALBUMS;
   const String count = tab.depth == 1 && counted ? formatCount(levelCount(l)) : String();
   int16_t room = statusX - 6 - x;
+  searchIconX = -1;
+  if (tab.depth == 1 && counted) {  // search
+    searchIconX = statusX - 22;
+    uiDrawIcon(ICONS_18, ICON_SEARCH, searchIconX, 7, pal.text);
+    room -= 26;
+  }
   if (count.length()) room -= uiTextWidth(FONT_SMALL, count.c_str()) + 5;
   if (tab.depth > 1 && hasHero(l)) {  // the page's own name is in its header: show where it came from
     const String &parent = tab.stack[tab.depth - 2].title;
@@ -2093,7 +2138,9 @@ static void openNow() {
 }
 
 // Ends Now Playing without drawing (another screen takes over).
+static void dropSearch();
 static void dropNow() {
+  dropSearch();
   if (nowOpen) {
     nowOpen = false;
     titleMarquee.active = false;
@@ -2442,6 +2489,173 @@ bool uiTakeWifiSetupRequest() {
   return requested;
 }
 
+// ---------------------------------------------------------------- Search
+// The header's search icon (Songs, Artists, Albums) opens a field with the
+// keyboard; "Search" finds the text anywhere in artist and album names and
+// in songs' titles, artists and albums, and shows the hits as a list
+// (artists, albums, then songs A-Z; songs play in that order).
+#define SEARCH_KB_Y (SCREEN_H - KB_H)
+#define SEARCH_MAX_HITS 200
+static bool searchOpen = false;
+static String searchQuery;
+
+struct SearchDraw {  // unmutes the LCD for the search screen's drawing
+  SearchDraw() { lcdSetMuted(false); }
+  ~SearchDraw() { lcdSetMuted(searchOpen || nowOpen); }
+};
+
+static void drawSearchField() {
+  canvas->fillRect(0, 0, SCREEN_W, HEADER_H, pal.bg);
+  uiDrawIcon(ICONS_24, ICON_BACK, 4, 4, pal.text);
+  const int16_t fx = 32, fw = SCREEN_W - 40;
+  canvas->fillRect(fx, 4, fw, 24, pal.surface);
+  roundRect(fx, 4, fw, 24, uiRadiusPill(24), pal.bg);
+  uiDrawIcon(ICONS_18, ICON_SEARCH, fx + 6, 7, pal.faint);
+  if (searchQuery.isEmpty()) {
+    uiDrawText(FONT_SMALL, "Songs, artists, albums", fx + 28, 20, pal.faint);
+  } else {
+    String shown = searchQuery + "_";
+    while (shown.length() > 1 && uiTextWidth(FONT_BODY, shown.c_str()) > fw - 36) shown.remove(0, 1);
+    uiDrawText(FONT_BODY, shown.c_str(), fx + 28, 21, pal.text);
+  }
+  lcdBlit(0, 0, SCREEN_W, HEADER_H);
+}
+
+static void drawSearchHint(const String &a, const String &b) {
+  lcdFillRect(0, HEADER_H, SCREEN_W, SEARCH_KB_Y - HEADER_H, pal.bg);
+  canvas->fillRect(0, 0, SCREEN_W, 40, pal.bg);
+  drawCentered(FONT_BODY, uiFitText(FONT_BODY, a, SCREEN_W - 20), SCREEN_W / 2, 16, pal.dim);
+  drawCentered(FONT_SMALL, uiFitText(FONT_SMALL, b, SCREEN_W - 20), SCREEN_W / 2, 33, pal.faint);
+  lcdBlit(0, HEADER_H + 40, SCREEN_W, 40);
+}
+
+static void openSearch() {
+  stopList();
+  listMarquee.active = false;
+  searchOpen = true;
+  searchQuery = "";
+  SearchDraw unmute;
+  setListOffset(0);  // this screen covers the hardware-scrolled list area
+  drawSearchField();
+  drawSearchHint("Search your library", "Type part of a name, then Search");
+  keyboardShow(SEARCH_KB_Y, "Search");
+}
+
+static void dropSearch() {
+  if (searchOpen) {
+    searchOpen = false;
+    lcdSetMuted(nowOpen);
+    lcdScrollOffset(listOffset);
+  }
+}
+
+static bool containsNoCase(const char *hay, const String &needle) {
+  const size_t n = needle.length();
+  for (; *hay; hay++) {
+    if (strncasecmp(hay, needle.c_str(), n) == 0) return true;
+  }
+  return false;
+}
+
+// Runs the search; true if anything was found (searchHits filled).
+static bool runSearch(const String &q) {
+  searchHits.clear();
+  searchSongStart = 0;
+  const uint32_t t0 = millis();
+  ArtistRecord a;
+  for (uint32_t i = 0; i < Catalog::artistCount() && searchHits.size() < SEARCH_MAX_HITS; i++) {
+    if (Catalog::artist(i, a) && containsNoCase(a.name, q)) searchHits.push_back({R_ARTIST, i});
+  }
+  AlbumRecord al;
+  uint32_t id;
+  for (uint32_t p = 0; p < Catalog::albumIndexCount() && searchHits.size() < SEARCH_MAX_HITS; p++) {
+    if (Catalog::albumByName(p, id) && Catalog::album(id, al) && !(al.flags & ALBUM_NONE_ALL) &&
+        containsNoCase(al.name, q)) {
+      searchHits.push_back({R_ALBUM, id});
+    }
+  }
+  searchSongStart = searchHits.size();
+  // Songs: one pass over songs.dat. Copies of a song (hidden from the lists)
+  // are told apart only by their folder, so equal title + artist is shown once.
+  struct Found {
+    uint32_t id, same;
+    String title;
+  };
+  std::vector<Found> found;
+  LibReader songs;
+  if (songs.open(Catalog::generation(), LF_SONGS, sizeof(SongRecord))) {
+    songs.setReadAhead(8192);
+    SongRecord r;
+    for (uint32_t i = 0; i < songs.count() && searchHits.size() + found.size() < SEARCH_MAX_HITS; i++) {
+      if (!songs.read(i, &r)) break;
+      if (!containsNoCase(r.title, q) && !containsNoCase(r.artist, q) && !containsNoCase(r.album, q)) continue;
+      String key = String(r.title) + "\x1f" + r.artist;
+      key.toLowerCase();
+      uint32_t h = 2166136261u;
+      for (size_t k = 0; k < key.length(); k++) h = (h ^ static_cast<uint8_t>(key[k])) * 16777619u;
+      bool dup = false;
+      for (const Found &f : found) dup = dup || f.same == h;
+      if (!dup) found.push_back({i, h, String(r.title)});
+    }
+  }
+  std::sort(found.begin(), found.end(),
+            [](const Found &x, const Found &y) { return strcasecmp(x.title.c_str(), y.title.c_str()) < 0; });
+  for (const Found &f : found) searchHits.push_back({R_SONG, f.id});
+  Serial.printf("[search] \"%s\": %u artists and albums, %u songs in %lu ms\n", q.c_str(), searchSongStart,
+                found.size(), millis() - t0);
+  return !searchHits.empty();
+}
+
+static void searchTouch(TouchPhase phase, int16_t x, int16_t y) {
+  SearchDraw unmute;
+  if (phase == TOUCH_DOWN && y < HEADER_H && x < 36) {
+    dropSearch();
+    uiShowPlayer();
+    return;
+  }
+  if (y < SEARCH_KB_Y && phase == TOUCH_DOWN) return;
+  const KeyPress k = keyboardTouch(phase, x, y);
+  switch (k.action) {
+    case KEY_CHAR:
+      if (searchQuery.length() < 40) searchQuery += k.c;
+      drawSearchField();
+      break;
+    case KEY_DELETE:
+      if (searchQuery.length()) searchQuery.remove(searchQuery.length() - 1);
+      drawSearchField();
+      break;
+    case KEY_BACK:
+      dropSearch();
+      uiShowPlayer();
+      break;
+    case KEY_ENTER: {
+      String q = searchQuery;
+      q.trim();
+      if (q.length() < 2) {
+        drawSearchHint("Type at least 2 letters", "");
+        break;
+      }
+      drawSearchHint("Searching...", q);
+      if (!runSearch(q)) {
+        drawSearchHint("Nothing found", q);
+        break;
+      }
+      dropSearch();
+      Tab &tab = tabs[activeTab];
+      if (tab.depth < MAX_NAV_DEPTH) {
+        Level &l = tab.stack[tab.depth++];
+        l = Level();
+        l.kind = L_SEARCH;
+        l.title = "\xE2\x80\x9C" + q + "\xE2\x80\x9D";
+      }
+      clearRowCache();
+      uiShowPlayer();
+      break;
+    }
+    default: break;
+  }
+}
+
 static void nowTouch(TouchPhase phase, int16_t x, int16_t y) {
   if (phase == TOUCH_UP) {
     volumeDrag = false;
@@ -2505,6 +2719,10 @@ void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
     if (phase == TOUCH_UP) swallowTouch = false;
     return;
   }
+  if (searchOpen) {
+    searchTouch(phase, x, y);
+    return;
+  }
   if (nowOpen) {
     nowTouch(phase, x, y);
     return;
@@ -2538,6 +2756,8 @@ void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
   if (y < HEADER_H) {
     if (x < 40 && tabs[activeTab].depth > 1) {
       goBack();
+    } else if (searchIconX >= 0 && x >= searchIconX - 6 && x < searchIconX + 24) {
+      openSearch();
     } else if (x >= SCREEN_W - 60 && libraryStatus.isEmpty()) {  // hold the status to rebuild
       statusHoldStart = millis() | 1;
       uiSetLibraryStatus("Hold to rebuild");

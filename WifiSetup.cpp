@@ -6,6 +6,7 @@
 
 #include "Config.h"
 #include "Lcd.h"
+#include "Keyboard.h"
 #include "UiFont.h"
 #include "Text.h"
 
@@ -20,14 +21,12 @@ namespace {
 #define WS_STATUS_Y (WS_ROWS_Y + WS_ROW_H * WS_ROWS)  // 250: "page 1 of 2"
 #define WS_BUTTONS_Y (SCREEN_H - CANVAS_H)            // 276
 #define WS_FIELD_Y 96                // password field
-#define WS_KEY_H 42
-#define WS_KEYS_Y (SCREEN_H - 4 * WS_KEY_H)           // 152
+#define WS_KEYS_Y (SCREEN_H - KB_H)                   // 152
 #define WS_CONNECT_TIMEOUT_MS 20000
 #define WS_MAX_NETWORKS 30
 #define WS_MAX_PASSWORD 63
 
 enum Screen { S_LIST, S_PASSWORD, S_CONNECTING, S_MESSAGE };
-enum KeyCode : uint8_t { K_SHIFT = 1, K_DEL, K_LAYER, K_SYM2, K_BACK, K_JOIN };
 
 struct Net {
   String ssid;
@@ -35,11 +34,6 @@ struct Net {
   bool secure;
 };
 
-struct Key {
-  int16_t x, w;
-  uint8_t code;  // a character, or a KeyCode
-  const char *label;  // nullptr: the character itself
-};
 
 Screen screen = S_LIST;
 WifiSetupResult result = WS_RUNNING;
@@ -48,8 +42,7 @@ bool scanning = false;
 uint32_t page = 0;
 String chosen, password;
 bool usingSaved = false;  // trying the saved password, no keyboard shown
-int layer = 0;            // 0 lower, 1 upper, 2 digits/symbols, 3 more symbols
-int pressedRow = -1, pressedKey = -1, pressedButton = -1, pressedNet = -1;
+int pressedButton = -1, pressedNet = -1;
 uint32_t connectStart = 0;
 uint32_t messageUntil = 0;
 Screen afterMessage = S_LIST;
@@ -208,57 +201,6 @@ void collectScan(int count) {
   }
 }
 
-// ---------------------------------------------------------------- keyboard
-const char *const letterRows[] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
-const char *const symRows[2][3] = {
-  {"1234567890", "-/:;()$&@", ".,?!'\"_"},
-  {"[]{}#%^*+=", "\\|~<>`", ".,?!'\"_"},
-};
-
-// Keys of one keyboard row in the current layer.
-std::vector<Key> keyRow(int row) {
-  std::vector<Key> keys;
-  if (row == 3) {
-    keys.push_back({0, 48, K_BACK, "Back"});
-    keys.push_back({48, 48, K_LAYER, layer >= 2 ? "ABC" : "123"});
-    keys.push_back({96, 72, ' ', "space"});
-    keys.push_back({168, 72, K_JOIN, "Join"});
-    return keys;
-  }
-  const char *chars = layer >= 2 ? symRows[layer - 2][row] : letterRows[row];
-  const int n = strlen(chars);
-  int16_t x = row == 2 ? 36 : (SCREEN_W - n * 24) / 2;
-  if (row == 2) {
-    keys.push_back({0, 36, static_cast<uint8_t>(layer >= 2 ? K_SYM2 : K_SHIFT),
-                    layer == 2 ? "#+=" : layer == 3 ? "123" : "shift"});
-  }
-  for (int i = 0; i < n; i++, x += 24) {
-    const char c = layer == 1 ? toupper(chars[i]) : chars[i];
-    keys.push_back({x, 24, static_cast<uint8_t>(c), nullptr});
-  }
-  if (row == 2) keys.push_back({204, 36, K_DEL, "del"});
-  return keys;
-}
-
-void drawKeyRow(int row) {
-  canvas->fillRect(0, 0, SCREEN_W, WS_KEY_H, C_BG);
-  const std::vector<Key> keys = keyRow(row);
-  for (size_t i = 0; i < keys.size(); i++) {
-    const Key &k = keys[i];
-    const bool pressed = row == pressedRow && static_cast<int>(i) == pressedKey;
-    const bool active = (k.code == K_SHIFT && layer == 1);
-    canvas->fillRoundRect(k.x + 2, 3, k.w - 4, WS_KEY_H - 6, 4,
-                          pressed ? C_BUTTON_PRESS : active ? C_TAB_ACTIVE : C_BUTTON);
-    if (k.label) {
-      const int16_t tw = uiTextWidth(FONT_LABEL, k.label);
-      uiDrawText(FONT_LABEL, k.label, k.x + (k.w - tw) / 2, WS_KEY_H / 2 + 4, k.code == K_JOIN ? C_ACCENT : C_TEXT);
-    } else {
-      centered(String(static_cast<char>(k.code)), k.x + k.w / 2, WS_KEY_H / 2 - 9, 2, C_TEXT);
-    }
-  }
-  lcdBlit(0, WS_KEYS_Y + row * WS_KEY_H, SCREEN_W, WS_KEY_H);
-}
-
 void drawField() {
   canvas->fillRect(0, 0, SCREEN_W, CANVAS_H, C_BG);
   canvas->drawRoundRect(6, 4, SCREEN_W - 12, 36, 4, C_DIM);
@@ -268,19 +210,14 @@ void drawField() {
   lcdBlit(0, WS_FIELD_Y, SCREEN_W, CANVAS_H);
 }
 
-void drawKeyboard() {
-  for (int r = 0; r < 4; r++) drawKeyRow(r);
-}
-
 void showPassword(const char *note = nullptr) {
   screen = S_PASSWORD;
   buttonCount = 0;
-  pressedRow = pressedKey = -1;
   lcdFillRect(0, WS_HEADER_H, SCREEN_W, SCREEN_H - WS_HEADER_H, C_BG);
   drawHeader("WiFi password");
   drawTwoLines(WS_INTRO_Y, note ? note : "Password for", display(chosen), note ? C_ACCENT : C_DIM);
   drawField();
-  drawKeyboard();
+  keyboardShow(WS_KEYS_Y, "Join");
 }
 
 // ---------------------------------------------------------------- connecting
@@ -324,7 +261,6 @@ void pickNetwork(int r) {
   if (i >= nets.size()) return;
   chosen = nets[i].ssid;
   password = "";
-  layer = 0;
   String s, p;
   usingSaved = wifiSavedCredentials(s, p) && s == chosen;
   if (usingSaved) {
@@ -336,28 +272,22 @@ void pickNetwork(int r) {
   }
 }
 
-void pressKey(const Key &k) {
-  switch (k.code) {
-    case K_SHIFT: layer = layer == 1 ? 0 : 1; drawKeyboard(); return;
-    case K_LAYER: layer = layer >= 2 ? 0 : 2; drawKeyboard(); return;
-    case K_SYM2: layer = layer == 2 ? 3 : 2; drawKeyboard(); return;
-    case K_DEL:
+void pressKey(const KeyPress &k) {
+  switch (k.action) {
+    case KEY_DELETE:
       if (password.length()) password.remove(password.length() - 1);
       drawField();
       return;
-    case K_BACK: showList(); return;
-    case K_JOIN:
+    case KEY_BACK: showList(); return;
+    case KEY_ENTER:
       if (password.length() >= 8) connectTo(chosen, password);  // WPA minimum
       else drawTwoLines(WS_INTRO_Y, "Passwords are at least 8 characters", display(chosen), C_ACCENT);
       return;
-    default:
-      if (password.length() < WS_MAX_PASSWORD) password += static_cast<char>(k.code);
+    case KEY_CHAR:
+      if (password.length() < WS_MAX_PASSWORD) password += k.c;
       drawField();
-      if (layer == 1) {  // shift applies to one letter
-        layer = 0;
-        drawKeyboard();
-      }
       return;
+    default: return;
   }
 }
 
@@ -454,34 +384,9 @@ void wifiSetupTouch(TouchPhase phase, int16_t x, int16_t y) {
       }
       return;
     }
-    case S_PASSWORD: {
-      const int row = y >= WS_KEYS_Y ? (y - WS_KEYS_Y) / WS_KEY_H : -1;
-      int key = -1;
-      std::vector<Key> keys;
-      if (row >= 0 && row < 4) {
-        keys = keyRow(row);
-        for (size_t i = 0; i < keys.size(); i++) {
-          if (x >= keys[i].x && x < keys[i].x + keys[i].w) key = i;
-        }
-      }
-      if (phase == TOUCH_DOWN || phase == TOUCH_MOVE) {
-        if (row != pressedRow || key != pressedKey) {  // follow the finger
-          const int oldRow = pressedRow;
-          pressedRow = key >= 0 ? row : -1;
-          pressedKey = key;
-          if (oldRow >= 0 && oldRow != pressedRow) drawKeyRow(oldRow);
-          if (pressedRow >= 0) drawKeyRow(pressedRow);
-        }
-      } else {  // TOUCH_UP: type the key under the finger
-        const int r = pressedRow, k = pressedKey;
-        pressedRow = pressedKey = -1;
-        if (r >= 0) {
-          drawKeyRow(r);
-          if (r == row && k == key) pressKey(keys[k]);
-        }
-      }
+    case S_PASSWORD:
+      pressKey(keyboardTouch(phase, x, y));
       return;
-    }
     case S_CONNECTING:
       if (phase == TOUCH_DOWN && buttonAt(x, y) == 0) {
         pressedButton = 0;
