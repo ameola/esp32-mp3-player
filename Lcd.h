@@ -16,6 +16,9 @@ extern GFXcanvas16 *canvas;  // SCREEN_W x CANVAS_H scratch area
 // Backlight brightness, 0 (off) to 100 %; may be called before lcdInit().
 void lcdSetBacklight(uint8_t percent);
 void lcdInit();
+// Sets the SPI pins' drive strength (SPI_PIN_DRIVE); lcdInit() calls it, and
+// the card mount again (SD.begin sets the pins up afresh).
+void spiPinDrive();
 
 void lcdFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
 

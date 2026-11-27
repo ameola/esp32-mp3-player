@@ -251,7 +251,8 @@ static void handleTouch(TouchPhase phase, int16_t x, int16_t y) {
 // Debug aid: inject touches over Serial: "tap x y", "drag x y1 y2 [ms]", "swipe y x1 x2",
 // "audiocpu" (time spent decoding over 3 s), "artscan" (album art survey),
 // "wifisetup" (WiFi setup screen), "artfetch" / "artstop" (album art pass), "artartists" (its artist steps only), "artpictures" (from the covers, past the lyrics), "libdump" (every song's cleaned tags and path), "uistyle" (set or reset the UI style),
-// "mem" (free memory after each startup step, and now),
+// "mem" (free memory after each startup step, and now), "audiostat" (output health since the last one,
+// without pausing the UI: DMA queue low point, longest decode step, lock wait, write gap, decode errors),
 // "hold x y ms". Prints the time taken and free heap afterwards.
 
 static void serviceSerialCommands() {
@@ -350,6 +351,23 @@ static void serviceSerialCommands() {
       artFetchStop();
     } else if (line == "artscan") {
       artScanStart();
+    } else if (line == "audiostat") {  // since the last "audiostat", without stopping the UI
+      extern uint32_t statQueuedLow, statLoopMaxUs, statLockWaitMaxUs, statGapMaxUs, audioDecodeUs;
+      extern uint32_t statDecodeErrors, statFrames;
+      extern uint32_t audioRingFrames();
+      static uint32_t lastAt = 0, under0 = 0;
+      const uint32_t span = millis() - lastAt;
+      Serial.printf("[audiostat] %lu ms: decode %lu%%, DMA queue low %ld of %lu frames, longest step %lu us, "
+                    "lock wait %lu us, write gap %lu us, underruns %lu, frames %lu, decode errors %lu\n",
+                    span, lastAt ? audioDecodeUs / 10 / max<uint32_t>(span, 1) : 0,
+                    statQueuedLow == UINT32_MAX ? -1L : static_cast<long>(statQueuedLow), audioRingFrames(),
+                    statLoopMaxUs, statLockWaitMaxUs, statGapMaxUs, audioUnderruns() - under0, statFrames,
+                    statDecodeErrors);
+      statFrames = statDecodeErrors = 0;
+      statQueuedLow = UINT32_MAX;
+      statLoopMaxUs = statLockWaitMaxUs = statGapMaxUs = audioDecodeUs = 0;
+      under0 = audioUnderruns();
+      lastAt = millis();
     } else if (line == "audiocpu") {
       extern uint32_t audioDecodeUs;
       audioDecodeUs = 0;
@@ -383,6 +401,7 @@ void setup() {
   audioInit();  // first, so the amp's inputs are driven before anything else
   Serial.begin(115200);
   memLog = "[mem] setup start    free " + String(heapAtStart) + "\n";
+  memLog += "[mem] PSRAM " + String(ESP.getPsramSize()) + " bytes, flash " + String(ESP.getFlashChipSize()) + " bytes\n";
   memStep("audio");
   uiStyleLoad();  // theme and layout settings, before anything is drawn
   lcdInit();

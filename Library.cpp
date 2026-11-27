@@ -6,6 +6,7 @@
 
 #include "CardFile.h"
 #include "Config.h"
+#include "Lcd.h"
 
 bool libraryIsMp3Name(const char *name) {
   if (name[0] == '.') {  // skips macOS "._" resource files too
@@ -31,6 +32,7 @@ bool libraryMountCard() {
     // so one slot is enough.
     if (SD.begin(SD_CS, SPI, SD_SPI_HZ, "/sd", 1)) {
       cardNoteMount();
+      spiPinDrive();
       if (attempt > 1) {
         Serial.printf("SD mounted on attempt %d\n", attempt);
       }

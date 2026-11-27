@@ -1539,6 +1539,12 @@ static void drawMovingList() {
     drawListBand(scrollPx, 0, LIST_H);
   } else if (delta != 0) {
     setListOffset(listOffset + delta);
+    // The panel shifted the letter strip with the list: put it back at once,
+    // before composing the new rows (~10 ms), or the letters visibly jump.
+    if (levelJump(level())) {
+      level().top = scrollPx / ROW_H;  // highlight the letter it's moving to
+      drawStrip();
+    }
     if (delta > 0) {
       drawListBand(scrollPx, LIST_H - delta, delta);
     } else {
@@ -1548,7 +1554,7 @@ static void drawMovingList() {
   shownPx = scrollPx;
   level().top = scrollPx / ROW_H;
   if (levelJump(level())) {
-    drawStrip();  // the panel shifted the letters too; a plain strip needs nothing
+    updateStrip();  // the highlighted letter may have changed
   }
   movingFrames++;
   movingFrameMs += millis() - t0;
@@ -2112,13 +2118,17 @@ static void lyricsParse(const String &text);
 
 // A song just started: if it has no lyrics yet (no .lrc file, never looked
 // up), the next download pass looks it up first.
+// Looking for an .lrc file scans the song's folder with the card held (2 s
+// in a folder of thousands of songs): after a song starts, that waits until
+// its read-ahead ring has filled (audioReadAheadSettled), so it can't run dry.
+static bool lyricsCheckDue = false;  // wantLyricsIfMissing() once the ring is full
+static bool lyricsWaiting = false;   // Now Playing's lyrics: loaded once the ring is full
+
 static void wantLyricsIfMissing() {
   if (!uiStyle.lyrics || !artFetchEnabled()) return;
   const int dot = currentPath.lastIndexOf('.');
-  FILINFO info;
-  for (const char *ext : {".lrc", ".LRC"}) {
-    if (dot > 0 && f_stat(cardPath(currentPath.substring(0, dot) + ext).c_str(), &info) == FR_OK) return;
-  }
+  FILINFO info;  // FatFs matches names ignoring case: ".lrc" finds ".LRC" too
+  if (dot > 0 && f_stat(cardPath(currentPath.substring(0, dot) + ".lrc").c_str(), &info) == FR_OK) return;
   if (LyricStore::find(lyricsKeyOf(current), nullptr) == LYR_NOT_LOOKED) artLyricsWant(current.id);
 }
 
@@ -2135,13 +2145,8 @@ static void lyricsLoad() {
   if (dot < 0) return;
   FIL *fil = cardNewFil();
   if (!fil) return;
-  bool open = false;
-  for (const char *ext : {".lrc", ".LRC"}) {
-    if (f_open(fil, cardPath(currentPath.substring(0, dot) + ext).c_str(), FA_READ) == FR_OK) {
-      open = true;
-      break;
-    }
-  }
+  // FatFs matches names ignoring case: ".lrc" finds ".LRC" too.
+  const bool open = f_open(fil, cardPath(currentPath.substring(0, dot) + ".lrc").c_str(), FA_READ) == FR_OK;
   String text;
   if (!open) {  // downloaded ones (LyricStore), else ask the next idle pass for them
     cardDeleteFil(fil);
@@ -2334,7 +2339,7 @@ static void drawLyrics(bool force) {
     const int16_t h = min<int16_t>(2 * LYRIC_H, LYRICS_H - band);
     canvas->fillRect(0, 0, SCREEN_W, h, pal.bg);
     if (!lyricCount) {
-      if (band == 2 * LYRIC_H) {  // why there are none
+      if (band == 2 * LYRIC_H && !lyricsWaiting) {  // why there are none
         // Looked up and not found, versus not looked up yet (and why).
         String a, b, c;
         if (lyricKind == LYR_INSTRUMENTAL) {
@@ -2420,8 +2425,14 @@ static void drawNow() {
   uiDrawIcon(ICONS_24, ICON_EXPAND, 6, 3, pal.text);
   const bool newSong = lyricSongId != current.id;
   if (newSong) {
-    if (uiStyle.lyrics) {
+    if (uiStyle.lyrics && audioReadAheadSettled()) {
+      lyricsWaiting = false;
       lyricsLoad();
+    } else if (uiStyle.lyrics) {
+      lyricsFree();  // uiTick loads them when the ring is full
+      lyricSongId = current.id;
+      lyricKind = LYR_NOT_LOOKED;
+      lyricsWaiting = true;
     } else {
       lyricsFree();
       lyricSongId = current.id;
@@ -2545,7 +2556,7 @@ static void startPlayback() {
     }
   }
   refusedInARow = 0;
-  wantLyricsIfMissing();
+  lyricsCheckDue = true;
   lastProgressPx = -1;
   refreshRows();  // move the playing highlight
   refreshPlaying();
@@ -3319,6 +3330,23 @@ void uiTick() {
   } else if (lyricCount && current.id != lyricSongId) {
     lyricsFree();  // another song: load its lyrics when Now Playing opens
     lyricSongId = LIB_NONE;
+  }
+
+  if ((lyricsCheckDue || lyricsWaiting) && audioReadAheadSettled()) {
+    if (lyricsCheckDue) {
+      lyricsCheckDue = false;
+      wantLyricsIfMissing();
+    }
+    if (lyricsWaiting) {
+      lyricsWaiting = false;
+      if (lyricSongId == current.id) {
+        lyricsLoad();
+        if (nowOpen && nowLyrics) {
+          NowDraw unmute;
+          drawLyrics(true);
+        }
+      }
+    }
   }
 
   static uint32_t lastSlow = 0;

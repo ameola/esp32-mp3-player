@@ -7,8 +7,8 @@
 
 // ---------------------------------------------------------------- Pins
 #define TFT_CS 13
-#define TFT_DC 16
-#define RESET_SHARED 17
+#define TFT_DC 4         // WROVER: GPIO16/17 belong to PSRAM
+#define RESET_SHARED 14
 #define TFT_BL 33
 #define TOUCH_SDA 21
 #define TOUCH_SCL 22
@@ -20,6 +20,17 @@
 #define I2S_BCLK 25
 #define I2S_LRCLK 26
 #define I2S_DOUT 32
+// Drive strength of the SPI pins the ESP32 drives (SCK, MOSI, the CSs, DC).
+// At the default (~20 mA) their sharp edges coupled into the amp's I2S wires
+// on the hand-wired WROVER board, and the MAX98357A stuttered while the
+// screen drew; the weakest setting (~5 mA) cured most of it, and card
+// reads at 20 MHz were byte-identical. The backlight's PWM pin is weakened
+// the same way, and the I2S pins to the amp get the strongest drive (~40 mA)
+// so noise coupled onto them moves them less: that pair sounded best in a
+// listening test. 0-3 = GPIO_DRIVE_CAP_0..3.
+#define SPI_PIN_DRIVE 0
+#define BL_PIN_DRIVE 0
+#define I2S_PIN_DRIVE 3
 
 // ---------------------------------------------------------------- Tuning
 // LCD: ComponentTest proved 2 MHz; 8 and 16 MHz were then verified clean on

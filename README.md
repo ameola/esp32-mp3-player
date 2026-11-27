@@ -1,6 +1,6 @@
 # ELEGOO ESP32 MP3 Player
 
-A touchscreen MP3 player for the ELEGOO ESP32-WROOM-32 (`ESP32 Dev Module`). It lists the MP3 files on the LCD board's microSD card and plays them through the MAX98357A I2S amplifier.
+A touchscreen MP3 player for an ESP32-WROVER-E dev board (16 MB flash, 8 MB PSRAM; DevKitC pinout, `ESP32 Dev Module` with PSRAM on). It was first built on an ELEGOO ESP32-WROOM-32 and still runs on one (with the old pins and the Huge APP scheme below). It lists the MP3 files on the LCD board's microSD card and plays them through the MAX98357A I2S amplifier.
 
 The original component test (display, touch, SD, two test tones) is kept in `ComponentTest/ComponentTest.ino`.
 
@@ -13,10 +13,12 @@ The original component test (display, touch, SD, two test tones) is kept in `Com
 ## Build and Upload
 
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --upload -p /dev/cu.usbserial-0001 .
+arduino-cli compile --fqbn esp32:esp32:esp32:PSRAM=enabled,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB --upload -p /dev/cu.usbmodem5C920449121 .
 ```
 
-The WiFi and HTTPS code makes the program about 1.38 MB, more than the default 1.25 MB app partition, so it needs the **Huge APP** scheme (3 MB app, no OTA; in the Arduino IDE: Tools → Partition Scheme). Settings saved in NVS (the WiFi network) are kept.
+PSRAM on, 16 MB flash, and the **16M Flash (3MB APP/9.9MB FATFS)** scheme: two 3 MB app slots (room for over-the-air updates). The program is about 1.6 MB. On the old WROOM-32 board use `PartitionScheme=huge_app` (3 MB app, no OTA) without the PSRAM and flash size options. Settings saved in NVS (the WiFi network) are kept.
+
+With PSRAM on, the core puts every allocation over 4 KB in PSRAM. That suits big buffers (the read-ahead ring), but the MP3 decoder allocates its state with the limit raised to 32 KB, so it stays in internal RAM: in PSRAM decoding took about 1.8x the CPU. (The core compiles everything with the PSRAM cache workaround for old chip revisions on either board; it can't be turned off from the sketch.)
 
 ### Benchmark build
 
@@ -171,9 +173,11 @@ The list area uses the panel's hardware vertical scrolling (VSCRDEF / VSCRSADD):
 Playback never depends on the UI loop:
 
 - **Decoder task** (core 0, priority 3, above the indexer): Helix decoder (`AudioGeneratorMP3a`), decodes ahead until the output is full, then sleeps a few ms. About 21% of a core.
-- **Read-ahead task** (core 0, priority 2): keeps 12 KB of the song file in RAM (0.3 s at 320 kbps, 0.75 s at 128 kbps). While the indexer writes, the card can stall a read for 150 ms or more; the decoder only ever reads from RAM.
+- **Read-ahead task** (core 0, priority 2): keeps 256 KB of the song file in PSRAM (6.5 s at 320 kbps, 16 s at 128 kbps; 12 KB of internal RAM without PSRAM). The card can be held for seconds by others: the indexer's writes, or a name lookup in a folder of thousands of files (FatFs scans the whole folder with the volume locked: 1-2 s in a folder of a few thousand songs). The decoder only ever reads from RAM. It fills at full speed in 8 KB reads up to 32 KB ahead, then in 2 KB reads with 6 ms pauses, since each read holds the SPI bus the screen shares and the screen waits for it between lines.
+- **Waiting for the ring**: after a song starts, the `.lrc` lookups (the lyrics page and the download pass's "wanted" check) wait until the ring is full (`audioReadAheadSettled`), so a slow lookup can't run the song dry. FatFs matches names ignoring case, so one lookup covers `.lrc` and `.LRC`.
 - **Output**: 6 DMA buffers (78 ms). ESP8266Audio's `AudioOutputI2S` makes one `i2s_channel_write()` per sample (about 40% of a core on its own); `ContinuousI2S` stages samples and writes blocks. The I2S clocks never stop (see the noise note above).
 - The UI calls (play, stop, pause, position, volume) take a lock shared with the decoder task.
+- Serial `audiostat` reports, since the last one and without pausing the UI: decode load, the DMA queue's low point, the longest decode step, the decoder's longest wait for its lock, the longest gap between writes to I2S, underruns, frames and decode errors.
 - Serial `audiocpu` shows decode time, underruns (the output running dry: an audible gap) and the read-ahead low-water mark over 3 s; `[scroll]` lines include the underrun count.
 
 - **Released while idle.** For album art downloads the decoder and the read-ahead ring are freed (`audioReleaseEngine`, only while stopped or paused); `audioPlay` / `audioResume` rebuild them, and a paused song reopens at its byte position. The decoder's loop guards against a false frame sync right after such a seek (Helix then reports 0 channels and the library would divide by zero).
@@ -190,7 +194,8 @@ Measured with music playing and a full library rebuild running: no underruns; sc
 ## Wiring
 
 - Shared SPI: GPIO18 SCK, GPIO19 MISO, GPIO23 MOSI. TFT_CS=13, SD_CS=27.
-- TFT DC=16, shared LCD/CTP reset=17, backlight=33.
+- TFT DC=4, shared LCD/CTP reset=14, backlight=33. (GPIO16/17 are the WROVER's PSRAM: leave them unconnected.)
+- The SPI pins the ESP32 drives (SCK, MOSI, TFT_CS, DC, SD_CS) and the backlight's PWM pin run at the weakest drive strength (`SPI_PIN_DRIVE`, `BL_PIN_DRIVE`, ~5 mA), and the three I2S pins at the strongest (`I2S_PIN_DRIVE`, ~40 mA). At the defaults the SPI edges coupled into the I2S wires and the amp stuttered while the screen drew (slowing the clock didn't help; weaker edges did, and stronger I2S drive on top sounded best). Card reads at 20 MHz stayed byte-identical. Keep the I2S wires short and away from the SPI ones.
 - Touch SDA=21, SCL=22 at 100 kHz, address 0x38. CTP_INT stays disconnected; touch is polled.
 - MAX98357A: BCLK=25, LRCLK=26, DIN=32. Connect the speaker across OUT+ and OUT-, never to ground.
 - Display VCC and MAX98357A VIN use 5 V with common grounds. Use a 5 V supply that can handle both.

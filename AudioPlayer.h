@@ -36,7 +36,13 @@ void audioSetVolumeLimit(uint8_t percent);
 // Times the output ran dry during playback (audible gaps), since boot.
 uint32_t audioUnderruns();
 
-// The decoder and the read-ahead ring (about 45 KB) can be freed while
+// The read-ahead ring is full (or holds the rest of the song), or nothing
+// plays. Card work that can hold the card for long (name lookups in big
+// folders) waits for this after a song starts, so the song can't run dry.
+bool audioReadAheadSettled();
+
+// The decoder and the read-ahead ring (about 45 KB of internal RAM without
+// PSRAM; with it the ring is in PSRAM) can be freed while
 // nothing plays, for album art downloads. Only when stopped or paused (false
 // while playing). A paused song keeps its place: audioResume() rebuilds the
 // engine and continues from there; audioPlay() rebuilds it too. The I2S

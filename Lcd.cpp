@@ -1,10 +1,18 @@
 #include "Lcd.h"
 
 #include <SPI.h>
+#include <esp_heap_caps.h>
 #include <Adafruit_ILI9341.h>
 
 #include "AudioPlayer.h"
 #include "Config.h"
+#include <driver/gpio.h>
+
+void spiPinDrive() {
+  for (int pin : {SPI_SCK, SPI_MOSI, TFT_CS, TFT_DC, SD_CS}) {
+    gpio_set_drive_capability(static_cast<gpio_num_t>(pin), static_cast<gpio_drive_cap_t>(SPI_PIN_DRIVE));
+  }
+}
 
 // Only used for its begin() (pin setup + its init sequence), as in ComponentTest.
 static Adafruit_ILI9341 tft(&SPI, TFT_CS, TFT_DC, -1);
@@ -110,6 +118,7 @@ void lcdInit() {
 
   // PWM at 25 kHz: above hearing, so it can't whine through the amp.
   ledcAttach(TFT_BL, 25000, 8);
+  gpio_set_drive_capability(static_cast<gpio_num_t>(TFT_BL), static_cast<gpio_drive_cap_t>(BL_PIN_DRIVE));
   backlightReady = true;
   lcdSetBacklight(backlightPercent);
 
@@ -117,8 +126,13 @@ void lcdInit() {
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, TFT_CS);
   tft.begin(2000000);
   initVendorIli9341();
+  spiPinDrive();
 
+  // In internal RAM (23 KB): every row and label is composed here, and in
+  // PSRAM that is markedly slower. Blocks over 4 KB normally go to PSRAM.
+  heap_caps_malloc_extmem_enable(32 * 1024);
   canvas = new GFXcanvas16(SCREEN_W, CANVAS_H);
+  heap_caps_malloc_extmem_enable(4096);
   canvas->setTextWrap(false);
   lcdFillRect(0, 0, SCREEN_W, SCREEN_H, C_BG);
 }

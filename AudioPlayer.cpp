@@ -5,6 +5,7 @@
 
 #include "CardFile.h"
 #include <atomic>
+#include <driver/gpio.h>
 #include <esp_heap_caps.h>
 #include <new>
 #include <AudioGeneratorMP3a.h>
@@ -27,6 +28,22 @@ static uint32_t ringSamples = 0;
 
 // The DMA ring played out completely before new samples arrived (an audible
 // gap). Silence while stopped or paused does the same, so only count playback.
+// Health (Serial "audiostat"): frames written to the DMA ring vs. sent by the
+// hardware; their difference is how much is queued. Its low point over a
+// window shows how close playback came to running dry.
+static volatile uint32_t framesWritten = 0, framesSent = 0, dmaFrames = 0;
+static bool IRAM_ATTR onSent(i2s_chan_handle_t, i2s_event_data_t *, void *) {
+  // Sending more than was written: the ring replayed (paused, stopped, or ran dry).
+  const uint32_t sent = framesSent + dmaFrames;
+  framesSent = static_cast<int32_t>(sent - framesWritten) > 0 ? framesWritten : sent;
+  return false;
+}
+uint32_t statQueuedLow = UINT32_MAX;   // fewest frames queued after a write while playing
+uint32_t statLoopMaxUs = 0;            // longest single decoder step
+uint32_t statLockWaitMaxUs = 0;        // longest wait of the decoder task for `lock`
+uint32_t statGapMaxUs = 0;             // longest time between two writes while playing
+uint32_t statDecodeErrors = 0, statFrames = 0;  // frames Helix refused / decoded
+
 static bool IRAM_ATTR onSendQueueOverflow(i2s_chan_handle_t, i2s_event_data_t *, void *) {
   if (state == PLAYING && trackSamples > ringSamples) {
     underruns = underruns + 1;
@@ -96,6 +113,8 @@ public:
         i2s_channel_disable(_tx_handle);
         i2s_event_callbacks_t callbacks = {};
         callbacks.on_send_q_ovf = onSendQueueOverflow;
+        callbacks.on_sent = onSent;
+        dmaFrames = _bufferWords;
         i2s_channel_register_event_callback(_tx_handle, &callbacks, nullptr);
         i2s_channel_enable(_tx_handle);
       }
@@ -130,6 +149,7 @@ public:
         break;
       }
       frames -= written / sizeof(uint32_t);
+      framesWritten = framesWritten + written / sizeof(uint32_t);
     }
   }
 
@@ -197,6 +217,16 @@ private:
     i2s_channel_write(_tx_handle, stage, pending * sizeof(uint32_t), &written, 0);
     const size_t n = written / sizeof(uint32_t);
     trackSamples = trackSamples + n;
+    framesWritten = framesWritten + n;
+    if (n && state == PLAYING) {
+      const uint32_t now = micros();
+      if (lastWriteUs && now - lastWriteUs > statGapMaxUs) statGapMaxUs = now - lastWriteUs;
+      lastWriteUs = now;
+      const uint32_t queued = framesWritten - framesSent;
+      if (queued < statQueuedLow) statQueuedLow = queued;
+    } else if (state != PLAYING) {
+      lastWriteUs = 0;
+    }
     if (n) {
       memmove(stage, stage + n, (pending - n) * sizeof(uint32_t));
       pending -= n;
@@ -204,6 +234,7 @@ private:
   }
 
   bool started = false;
+  uint32_t lastWriteUs = 0;
   uint32_t stage[STAGE_SAMPLES];
   size_t pending = 0;
 };
@@ -223,27 +254,54 @@ struct AudioLock {
   ~AudioLock() { xSemaphoreGive(lock); }
 };
 
-// Song file read ahead into RAM by its own task. While the library indexer
-// writes, the card can stall a read for 150 ms or more; the ring covers
-// 0.3 s (320 kbps) to 0.75 s (128 kbps), so the decoder never waits on it.
+// Song file read ahead into RAM by its own task. The card can be held for
+// seconds by others: the library indexer's writes, or a name lookup in a
+// folder of thousands of files (FatFs keeps the volume locked while it scans
+// the whole folder). With PSRAM the ring holds 256 KB (6.5 s at 320 kbps,
+// 16 s at 128 kbps); without it 12 KB (0.3 to 0.75 s).
 // One producer (reader task) and one consumer (decoder, under `lock`);
 // open/seek/close hold both `lock` and fileLock, so neither side is mid-way.
 class PrefetchSource : public AudioFileSource {
 public:
-  static constexpr uint32_t RING = 12288;
-  static constexpr uint32_t CHUNK = 2048;
+  static constexpr uint32_t RING_PSRAM = 256 * 1024, CHUNK_PSRAM = 8192;
+  static constexpr uint32_t RING_SMALL = 12288, CHUNK_SMALL = 2048;
 
   PrefetchSource() {
     fileLock = xSemaphoreCreateMutex();
+    ring = static_cast<uint8_t *>(heap_caps_malloc(RING_PSRAM, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (ring) {
+      cap = RING_PSRAM;
+      chunk = CHUNK_PSRAM;
+    } else {
+      ring = static_cast<uint8_t *>(heap_caps_malloc(RING_SMALL, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      cap = RING_SMALL;
+      chunk = CHUNK_SMALL;
+    }
+    lowWater = cap;
   }
 
   ~PrefetchSource() override {
     closeFile();
     cardDeleteFil(fil);
-    vSemaphoreDelete(fileLock);
+    if (fileLock) vSemaphoreDelete(fileLock);
+    free(ring);
   }
 
-  bool ok() const { return fileLock != nullptr; }
+  bool ok() const { return fileLock != nullptr && ring != nullptr; }
+  uint32_t capacity() const { return cap; }
+
+  // The ring is full, or holds the rest of the song (Serial and the UI:
+  // card work that can hold the card for long waits for this).
+  // Over 0.8 s of audio (at 320 kbps) buffered: the reader can let others
+  // (the screen, on the same SPI bus) have the card between its reads.
+  bool comfortable() {
+    return wr.load(std::memory_order_acquire) - rd.load() >= 32 * 1024 || atEof.load(std::memory_order_acquire);
+  }
+
+  bool settled() {
+    const uint32_t buffered = wr.load(std::memory_order_acquire) - rd.load();
+    return !isOpen_ || atEof.load(std::memory_order_acquire) || cap - buffered < 2 * chunk;
+  }
 
   bool open(const char *path) override {
     FileLock held(fileLock);
@@ -296,8 +354,8 @@ public:
       vTaskDelay(1);
     }
     const uint32_t n = min(len, avail);
-    const uint32_t at = rd.load() % RING;
-    const uint32_t first = min(n, RING - at);
+    const uint32_t at = rd.load() % cap;
+    const uint32_t first = min(n, cap - at);
     memcpy(data, ring + at, first);
     memcpy(static_cast<uint8_t *>(data) + first, ring, n - first);
     rd.store(rd.load() + n, std::memory_order_release);
@@ -307,14 +365,17 @@ public:
   }
 
   // Reader task: tops the ring up. Returns false when there was nothing to do.
+  // Once comfortable it reads 2 KB at a time: each read holds the SPI bus the
+  // screen shares, and the screen waits for it between the lines it sends.
   bool fill() {
     FileLock held(fileLock);
     if (!isOpen_ || atEof.load()) return false;
     const uint32_t w = wr.load();
-    const uint32_t space = RING - (w - rd.load(std::memory_order_acquire));
-    if (space < CHUNK) return false;
-    const uint32_t at = w % RING;
-    const uint32_t want = min(CHUNK, RING - at);
+    const uint32_t space = cap - (w - rd.load(std::memory_order_acquire));
+    if (space < chunk) return false;
+    const uint32_t at = w % cap;
+    const uint32_t step = comfortable() ? CHUNK_SMALL : chunk;
+    const uint32_t want = min(step, cap - at);
     UINT n = 0;
     if (f_read(fil, ring + at, want, &n) != FR_OK || n == 0) {
       atEof.store(true, std::memory_order_release);
@@ -324,7 +385,7 @@ public:
     return true;
   }
 
-  uint32_t lowWater = RING;     // least buffered after a read (Serial "audiocpu")
+  uint32_t lowWater = 0;        // least buffered after a read (Serial "audiocpu")
   volatile uint32_t starved = 0;  // 1 ms waits for the card
 
 private:
@@ -353,7 +414,8 @@ private:
   uint32_t base = 0;  // file offset of ring position 0
   std::atomic<uint32_t> rd{0}, wr{0};
   std::atomic<bool> atEof{true};
-  uint8_t ring[RING];
+  uint8_t *ring = nullptr;
+  uint32_t cap = 0, chunk = 0;
 };
 
 static PrefetchSource *audioFile = nullptr;
@@ -381,7 +443,13 @@ public:
       if (FillBufferWithValidFrame()) {
         unsigned char *in = reinterpret_cast<unsigned char *>(buff);
         int bytesLeft = buffValid;
-        if (MP3Decode(hMP3Decoder, &in, &bytesLeft, outSample, 0) == 0) {
+        const int err = MP3Decode(hMP3Decoder, &in, &bytesLeft, outSample, 0);
+        if (err) {
+          statDecodeErrors++;
+        } else {
+          statFrames++;
+        }
+        if (err == 0) {
           lastFrameEnd = buffValid - bytesLeft;
           MP3FrameInfo fi;
           MP3GetLastFrameInfo(hMP3Decoder, &fi);
@@ -416,7 +484,7 @@ void audioReadStats(uint32_t &lowWater, uint32_t &starved) {
   }
   lowWater = audioFile->lowWater;
   starved = audioFile->starved;
-  audioFile->lowWater = PrefetchSource::RING;
+  audioFile->lowWater = audioFile->capacity();
   audioFile->starved = 0;
 }
 static Mp3Decoder *mp3 = nullptr;  // Helix decoder: about a third of libmad's CPU
@@ -431,15 +499,19 @@ uint32_t audioDecodeUs = 0;  // time spent decoding (Serial "audiocpu")
 static void audioTask(void *) {
   for (;;) {
     bool idle = true;
+    const uint32_t tw = micros();
     {
       AudioLock held;
+      if (micros() - tw > statLockWaitMaxUs) statLockWaitMaxUs = micros() - tw;
       if (state == PLAYING && mp3 && mp3->isRunning()) {
         const uint32_t t0 = micros();
         if (!mp3->loop()) {
           state = STOPPED;  // the generator stopped itself at end of file
           trackEnded = true;
         }
-        audioDecodeUs += micros() - t0;
+        const uint32_t took = micros() - t0;
+        audioDecodeUs += took;
+        if (took > statLoopMaxUs) statLoopMaxUs = took;
         idle = audioOut->full();
       }
     }
@@ -458,9 +530,12 @@ static void readerTask(void *) {
   for (;;) {
     xSemaphoreTake(readerLock, portMAX_DELAY);
     const bool worked = audioFile && audioFile->fill();
+    const bool relaxed = worked && audioFile->comfortable();
     xSemaphoreGive(readerLock);
     if (!worked) {
       vTaskDelay(pdMS_TO_TICKS(10));
+    } else if (relaxed) {
+      vTaskDelay(pdMS_TO_TICKS(6));  // ~300 KB/s still; the screen gets the bus in between
     }
   }
 }
@@ -473,7 +548,13 @@ static void (*beforeRestore)() = nullptr;
 
 static bool createEngine() {  // caller holds `lock`
   audioFile = new (std::nothrow) PrefetchSource();
+  // Helix's state and tables (several blocks of 4-10 KB) in internal RAM: in
+  // PSRAM every frame's work goes through the cache it shares with flash and
+  // the read-ahead ring, which costs time. Blocks over 4 KB normally go to
+  // PSRAM; this raises that limit while the decoder allocates.
+  heap_caps_malloc_extmem_enable(32 * 1024);
   mp3 = audioFile && audioFile->ok() ? new (std::nothrow) Mp3Decoder() : nullptr;
+  heap_caps_malloc_extmem_enable(4096);  // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
   if (!mp3 || !mp3->ok()) {
     xSemaphoreTake(readerLock, portMAX_DELAY);
     delete audioFile;
@@ -539,6 +620,10 @@ void audioInit() {
   audioOut->SetOutputModeMono(true);  // one speaker
   audioOut->SetRate(44100);
   audioOut->begin();
+  // Strong drive: noise coupled from the screen's wires moves these less (Config.h).
+  for (int pin : {I2S_BCLK, I2S_LRCLK, I2S_DOUT}) {
+    gpio_set_drive_capability(static_cast<gpio_num_t>(pin), static_cast<gpio_drive_cap_t>(I2S_PIN_DRIVE));
+  }
   audioSetVolume(DEFAULT_VOLUME);
   readerLock = xSemaphoreCreateMutex();
   {
@@ -677,6 +762,15 @@ int audioVolume() {
   return volume;
 }
 
+uint32_t audioRingFrames() {
+  return ringSamples;
+}
+
 uint32_t audioUnderruns() {
   return underruns;
+}
+
+bool audioReadAheadSettled() {
+  AudioLock held;
+  return !audioFile || state != PLAYING || audioFile->settled();
 }
