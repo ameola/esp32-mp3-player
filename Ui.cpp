@@ -1336,11 +1336,14 @@ static int stripLetter(const Level &l, const JumpTable *j) {
   return current;
 }
 
-static int stripShown = -2;  // letter highlighted on screen (-1: none)
+static int stripShown = -2;  // letter highlighted on screen (-1: none, -2: hidden)
 
-// The strip moves with the hardware-scrolled list, so every frame of a
-// moving list re-sends it: it's kept composed here (5.8 KB) and sent in one
-// or two transfers, rebuilt only when its letters change.
+// The panel's hardware scroll shifts whole rows, the strip's column with
+// them, so while the list moves the strip is hidden (its column blank: a
+// blank column shifts invisibly) and drawn again when the list settles.
+// Re-sending it each frame still showed the letters jump for the moment
+// between the shift and the re-send. Kept composed here (5.8 KB), rebuilt
+// only when its letters change.
 static bool nowOpen = false;  // Now Playing is up (its code is further down)
 static uint16_t stripBuf[STRIP_W * LIST_AREA_H];
 static int stripBuiltFor = -3;                 // highlighted letter it was built with
@@ -1380,6 +1383,12 @@ static void buildStrip(const JumpTable *j, int current) {
   stripBuiltFor = current;
   stripBuiltTable = j;
   stripStale = false;
+}
+
+static void hideStrip() {
+  if (stripShown == -2) return;
+  lcdFillRect(LIST_W, LIST_Y, STRIP_W, LIST_H, pal.bg);  // the whole column, wherever the offset is
+  stripShown = -2;
 }
 
 static void drawStrip() {
@@ -1538,13 +1547,8 @@ static void drawMovingList() {
   if (delta >= LIST_H || delta <= -LIST_H) {
     drawListBand(scrollPx, 0, LIST_H);
   } else if (delta != 0) {
+    hideStrip();  // before the shift: see stripShown
     setListOffset(listOffset + delta);
-    // The panel shifted the letter strip with the list: put it back at once,
-    // before composing the new rows (~10 ms), or the letters visibly jump.
-    if (levelJump(level())) {
-      level().top = scrollPx / ROW_H;  // highlight the letter it's moving to
-      drawStrip();
-    }
     if (delta > 0) {
       drawListBand(scrollPx, LIST_H - delta, delta);
     } else {
@@ -1553,9 +1557,6 @@ static void drawMovingList() {
   }
   shownPx = scrollPx;
   level().top = scrollPx / ROW_H;
-  if (levelJump(level())) {
-    updateStrip();  // the highlighted letter may have changed
-  }
   movingFrames++;
   movingFrameMs += millis() - t0;
 }
