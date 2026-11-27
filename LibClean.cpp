@@ -75,7 +75,20 @@ String tidy(const char *text) {
   String out;
   out.reserve(d.length());
   for (size_t i = 0; i < d.length(); i++) {
-    const char c = d[i] == '_' ? ' ' : d[i];
+    char c = d[i] == '_' ? ' ' : d[i];
+    // Japanese tags: the ideographic space (U+3000) as a space, full-width
+    // ASCII (U+FF01-FF5E, "Ｒｅｍｉｘ") as plain ASCII.
+    const uint8_t b0 = d[i], b1 = i + 1 < d.length() ? d[i + 1] : 0, b2 = i + 2 < d.length() ? d[i + 2] : 0;
+    if (b0 == 0xE3 && b1 == 0x80 && b2 == 0x80) {
+      c = ' ';
+      i += 2;
+    } else if (b0 == 0xEF && (b1 == 0xBC || b1 == 0xBD) && b2 >= 0x80 && b2 <= 0xBF) {
+      const uint32_t cp = 0xF000 | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+      if (cp >= 0xFF01 && cp <= 0xFF5E) {
+        c = static_cast<char>(cp - 0xFF01 + 0x21);
+        i += 2;
+      }
+    }
     if (isSpace(c) && (out.isEmpty() || out[out.length() - 1] == ' ')) continue;
     out += isSpace(c) ? ' ' : c;
   }
@@ -303,6 +316,50 @@ String splitDisc(const String &album, int &disc) {
   return name;
 }
 
+// Mostly letters the fonts don't have (Japanese, Greek, Cyrillic...): it
+// would show as a row of "?". The fonts carry Latin-1 and typographic
+// punctuation (U+2000-206F); anything past Latin Extended counts as missing.
+bool undrawable(const String &s) {
+  int missing = 0, shown = 0;
+  for (size_t i = 0; i < s.length();) {
+    const uint8_t c = s[i];
+    uint32_t cp = c;
+    int n = 1;
+    if (c >= 0xF0) cp = c & 0x07, n = 4;
+    else if (c >= 0xE0) cp = c & 0x0F, n = 3;
+    else if (c >= 0xC0) cp = c & 0x1F, n = 2;
+    for (int k = 1; k < n && i + k < s.length(); k++) cp = (cp << 6) | (s[i + k] & 0x3F);
+    i += n;
+    if (cp == ' ') continue;
+    if (cp > 0x24F && (cp < 0x2000 || cp > 0x206F)) missing++;
+    else shown++;
+  }
+  return missing > shown;
+}
+
+// "Artist - Album [2006]" from the song's folder, skipping disc folders
+// ("CD2", "Disc 1"); false if the folder isn't named that way.
+bool folderArtistAlbum(const char *folderPath, String &artist, String &album) {
+  String path = folderPath ? folderPath : "";
+  while (path.length()) {
+    const int slash = path.lastIndexOf('/');
+    String name = path.substring(slash + 1);
+    path = path.substring(0, max(slash, 0));
+    name = tidy(name.c_str());
+    int d = 0;
+    if (splitDisc("x " + name, d) == "x" && d) continue;  // "CD2", "Disc 1"
+    const std::vector<String> parts = dashParts(name);
+    if (parts.size() != 2 || parts[0].isEmpty() || parts[1].isEmpty()) return false;
+    artist = parts[0];
+    album = parts[1];
+    const int bracket = album.lastIndexOf(" [");  // "Back To Basics [2006]"
+    if (bracket > 0 && album.endsWith("]")) album = album.substring(0, bracket);
+    album.trim();
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 String libNormName(const char *name, bool dropThe) {
@@ -329,7 +386,7 @@ uint32_t libNormHash(const char *name, bool dropThe) {
   return h;
 }
 
-void libCleanSong(SongRecord &rec, const char *fileName) {
+void libCleanSong(SongRecord &rec, const char *fileName, const char *folderPath) {
   String stem = decodeUtf8(reinterpret_cast<const uint8_t *>(fileName), strlen(fileName));
   if (endsWithNoCase(stem, ".mp3")) stem.remove(stem.length() - 4);
   stem = tidy(stem.c_str());
@@ -339,12 +396,25 @@ void libCleanSong(SongRecord &rec, const char *fileName) {
     if (inList(a, kJunkArtists) || numberedJunk(a) || !hasLetter(a)) a = "";
     if (a.equalsIgnoreCase("various") || a.equalsIgnoreCase("various artist")) a = "Various Artists";
   };
+  // Tags the fonts can't show: the file and folder names say it instead.
+  const bool lostArtist = undrawable(artist) || undrawable(albumArtist);
+  if (undrawable(artist)) artist = "";
+  if (undrawable(albumArtist)) albumArtist = "";
+  if (undrawable(album)) album = "";
   junkArtist(artist);
   junkArtist(albumArtist);
   if (inList(album, kJunkAlbums) || numberedJunk(album) || webAddress(album)) album = "";
+  if (lostArtist && artist.isEmpty()) {
+    String a, b;
+    if (folderArtistAlbum(folderPath, a, b)) {
+      artist = a;
+      if (albumArtist.isEmpty()) albumArtist = a;
+      if (album.isEmpty()) album = b;
+    }
+  }
 
   String title = tidy(rec.title);
-  if (title.isEmpty() || trackTitle(title) || numberedJunk(title)) title = stem;
+  if (title.isEmpty() || trackTitle(title) || numberedJunk(title) || undrawable(title)) title = stem;
   if (endsWithNoCase(title, ".mp3")) {
     title.remove(title.length() - 4);
     title.trim();

@@ -39,7 +39,7 @@
 #define LIB_MAGIC "MP3L"
 // Song text is cleaned while tagging (LibClean.h); new rules need every song
 // retagged, so their version is part of the format version.
-#define LIB_CLEAN_VERSION 4  // 4: names kept as UTF-8 (accents)
+#define LIB_CLEAN_VERSION 6  // 6: ideographic spaces, full-width ASCII; 5: undrawable tags -> file/folder names; 4: names kept as UTF-8 (accents)
 // 3x: cleaned names, "none" albums, duplicates hidden (x = LIB_CLEAN_VERSION)
 #define LIB_FORMAT_VERSION (30 + LIB_CLEAN_VERSION)
 #define LIB_NONE 0xFFFFFFFFu

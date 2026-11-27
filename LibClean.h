@@ -11,6 +11,10 @@
 // - An untagged "Artist - Title" (also "Artist - Album - 03 - Title") split
 //   into its parts; "Artist - " before and " - Artist" / " - Various
 //   Artists" after a title dropped when they repeat the song's artist.
+// - Japanese ideographic spaces as spaces, full-width ASCII ("Ｒｅｍｉｘ") as ASCII.
+// - Tags mostly in letters the fonts lack (Japanese, Cyrillic...) treated
+//   as missing: the title comes from the file name, and the artist and album
+//   from an "Artist - Album [year]" folder (above any "CD2" folder).
 // - Placeholder tags ("Artist", "Album", "title", "<Unknown>", web
 //   addresses) treated as missing.
 // - "Disc 2", "(CD 1)", "[CD2]" taken off album names; the number becomes
@@ -22,7 +26,7 @@
 // Bump LIB_CLEAN_VERSION (LibFormat.h) when the rules change: the next
 // build then retags every song.
 
-void libCleanSong(SongRecord &rec, const char *fileName);
+void libCleanSong(SongRecord &rec, const char *fileName, const char *folderPath = "");
 
 // A name reduced for grouping: lower case letters and digits only, "&" and
 // "+" as "and", without a leading "the" if dropThe. Names with none of

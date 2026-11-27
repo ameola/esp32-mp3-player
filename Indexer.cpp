@@ -833,7 +833,7 @@ static bool buildSongs(uint32_t gen, uint32_t oldGen, const WalkResult &w, const
           card.close();
         }
         tagUs += micros() - tagStart;
-        libFillSong(rec, tags, name.c_str());
+        libFillSong(rec, tags, name.c_str(), path.c_str());
         st.tagged++;
       }
       rec.folderId = f;

@@ -15,7 +15,7 @@ void libSortCopy(uint8_t *dst, size_t n, const char *src);
 
 // Fills the tag-derived fields of a song record. `fileName` is the exact
 // on-card name (used for the title when the file has no title tag).
-void libFillSong(SongRecord &rec, const TagInfo &tags, const char *fileName);
+void libFillSong(SongRecord &rec, const TagInfo &tags, const char *fileName, const char *folderPath = "");
 
 // Writes one library file: header placeholder, records, extra, then the real
 // header. The file is only valid once finish() succeeds.

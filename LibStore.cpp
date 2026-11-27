@@ -45,7 +45,7 @@ void libCopyField(char *dst, size_t size, const String &text) {
   memset(dst + n, 0, size - n);
 }
 
-void libFillSong(SongRecord &rec, const TagInfo &tags, const char *fileName) {
+void libFillSong(SongRecord &rec, const TagInfo &tags, const char *fileName, const char *folderPath) {
   String title = tags.title;
   if (title.isEmpty()) {
     size_t len = strlen(fileName);
@@ -65,7 +65,7 @@ void libFillSong(SongRecord &rec, const TagInfo &tags, const char *fileName) {
   rec.durationSource = tags.durationSource;
   rec.audioStart = tags.audioStart;
   rec.audioEnd = tags.audioEnd;
-  libCleanSong(rec, fileName);
+  libCleanSong(rec, fileName, folderPath);
 }
 
 static uint32_t crc32(uint32_t crc, const void *data, size_t len) {
