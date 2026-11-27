@@ -39,7 +39,7 @@
 #define LIB_MAGIC "MP3L"
 // Song text is cleaned while tagging (LibClean.h); new rules need every song
 // retagged, so their version is part of the format version.
-#define LIB_CLEAN_VERSION 6  // 6: ideographic spaces, full-width ASCII; 5: undrawable tags -> file/folder names; 4: names kept as UTF-8 (accents)
+#define LIB_CLEAN_VERSION 7  // 7: start clusters kept; 6: ideographic spaces, full-width ASCII; 5: undrawable tags -> file/folder names; 4: names kept as UTF-8 (accents)
 // 3x: cleaned names, "none" albums, duplicates hidden (x = LIB_CLEAN_VERSION)
 #define LIB_FORMAT_VERSION (30 + LIB_CLEAN_VERSION)
 #define LIB_NONE 0xFFFFFFFFu
@@ -102,7 +102,8 @@ struct __attribute__((packed)) SongRecord {
   char artist[48];        // track artist, display text
   char album[48];
   char albumArtist[32];
-  uint8_t reserved1[16];
+  uint32_t startCluster;  // the file's first cluster, for opening without a name lookup (0: unknown)
+  uint8_t reserved1[12];
 };
 static_assert(sizeof(SongRecord) == 256, "SongRecord size");
 

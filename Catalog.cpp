@@ -70,6 +70,8 @@ bool song(uint32_t id, Track &out) {
   out.durationMs = r.durationMs;
   out.audioStart = r.audioStart;
   out.audioEnd = r.audioEnd;
+  out.fileSize = r.fileSize;
+  out.startCluster = r.startCluster;
   return true;
 }
 

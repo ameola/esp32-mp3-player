@@ -304,10 +304,16 @@ public:
   }
 
   bool open(const char *path) override {
+    return open(path, 0, 0);
+  }
+
+  // By start cluster when known (no name lookup: see cardOpenCluster), else by path.
+  bool open(const char *path, uint32_t cluster, uint32_t fileSize) {
     FileLock held(fileLock);
     closeFile();
     if (!fil) fil = cardNewFil();
-    isOpen_ = fil && f_open(fil, cardPath(path).c_str(), FA_READ) == FR_OK;
+    isOpen_ = fil && ((cluster && cardOpenCluster(fil, cluster, fileSize)) ||
+                      f_open(fil, cardPath(path).c_str(), FA_READ) == FR_OK);
     size = isOpen_ ? f_size(fil) : 0;
     reset(0);
     return isOpen_;
@@ -543,6 +549,7 @@ static void readerTask(void *) {
 // Engine release (album art downloads).
 static bool engineUp = false;
 static String currentPath;            // to reopen a paused song
+static uint32_t currentCluster = 0, currentSize = 0;
 static uint32_t resumePos = 0, resumeSize = 0;
 static void (*beforeRestore)() = nullptr;
 
@@ -650,11 +657,11 @@ static const char *playError = "";
 // Another format named .mp3 (seen: a WMA file): the decoder finds false
 // frame syncs all through it, plays noise and stutters, using half a core.
 // Its first bytes tell; nullptr if they look like an MP3 (or ID3 tag).
-static const char *otherFormat(const char *path) {
+static const char *otherFormat(const char *path, uint32_t cluster, uint32_t fileSize) {
   FIL *f = cardNewFil();
   uint8_t b[12] = {};
   UINT got = 0;
-  if (f && f_open(f, cardPath(path).c_str(), FA_READ) == FR_OK) {
+  if (f && ((cluster && cardOpenCluster(f, cluster, fileSize)) || f_open(f, cardPath(path).c_str(), FA_READ) == FR_OK)) {
     f_read(f, b, sizeof(b), &got);
     f_close(f);
   }
@@ -673,10 +680,35 @@ const char *audioPlayError() {
   return playError;
 }
 
-bool audioPlay(const char *path, uint32_t startOffset) {
+// A stored cluster is right if the song's first MPEG frame header is where
+// the library says (an ID3 tag at the start also passes). A file deleted and
+// copied back with the same name, size and date leaves the library looking
+// current but the cluster stale; then it's opened by path.
+static bool clusterLooksRight(uint32_t cluster, uint32_t fileSize, uint32_t audioStart) {
+  FIL *f = cardNewFil();
+  uint8_t b[3] = {};
+  UINT got = 0;
+  const bool ok = f && cardOpenCluster(f, cluster, fileSize) && f_lseek(f, audioStart) == FR_OK &&
+                  f_read(f, b, sizeof(b), &got) == FR_OK && got == sizeof(b);
+  if (f && ok) f_close(f);
+  cardDeleteFil(f);
+  return ok && ((b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) || (audioStart == 0 && !memcmp(b, "ID3", 3)));
+}
+
+bool audioPlay(const char *path, uint32_t startOffset, uint32_t startCluster, uint32_t fileSize) {
   audioStop();
   playError = "";
-  if (const char *format = otherFormat(path)) {
+  // Checked once per song; seeks and resumes reuse it (their offset is mid-song).
+  static uint32_t checkedCluster = 0;
+  if (startCluster && startCluster != checkedCluster) {
+    if (clusterLooksRight(startCluster, fileSize, startOffset)) {
+      checkedCluster = startCluster;
+    } else {
+      Serial.printf("[audio] stored cluster doesn't match the file: opening %s by path\n", path);
+      startCluster = 0;
+    }
+  }
+  if (const char *format = otherFormat(path, startCluster, fileSize)) {
     static char why[40];
     snprintf(why, sizeof(why), "a %s file, not an MP3", format);
     playError = why;
@@ -687,7 +719,9 @@ bool audioPlay(const char *path, uint32_t startOffset) {
   trackEnded = false;
   trackSamples = 0;
   currentPath = path;
-  if (audioFile->open(path) &&
+  currentCluster = startCluster;
+  currentSize = fileSize;
+  if (audioFile->open(path, startCluster, fileSize) &&
       (startOffset == 0 || startOffset >= audioFile->getSize() ||
        audioFile->seek(startOffset, SEEK_SET)) &&
       mp3->begin(audioFile, audioOut)) {
@@ -711,7 +745,7 @@ void audioResume() {
     const String path = currentPath;
     const uint32_t pos = resumePos;
     state = STOPPED;
-    audioPlay(path.c_str(), pos);
+    audioPlay(path.c_str(), pos, currentCluster, currentSize);
     return;
   }
   AudioLock held;

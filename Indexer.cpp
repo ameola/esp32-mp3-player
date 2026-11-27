@@ -841,6 +841,7 @@ static bool buildSongs(uint32_t gen, uint32_t oldGen, const WalkResult &w, const
       rec.nameLen = srec.nameLen;
       rec.fileSize = srec.size;
       rec.mtime = srec.mtime;
+      rec.startCluster = srec.cluster;  // this walk's (0 if not captured)
       rec.artistId = rec.albumId = LIB_NONE;
       ok = songs.append(&rec);
 

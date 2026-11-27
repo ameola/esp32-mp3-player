@@ -36,6 +36,13 @@ String cardPath(const String &path);
 // (7-11 ms per file measured, growing with folder size).
 bool cardCaptureEntry(const FF_DIR &dir, const FILINFO &info, uint32_t &startCluster);
 
+// Opens a file read-only from its start cluster and size (as captured above,
+// and kept in the library's song records), without f_open's name lookup:
+// in a folder of thousands of files that scans the folder for 1-2 s with
+// the card held. `fil` from cardNewFil(); close with f_close. False if the
+// volume isn't mounted or the values can't be right.
+bool cardOpenCluster(FIL *fil, uint32_t startCluster, uint32_t size);
+
 // Background indexing runs on core 0 above the idle task (which feeds the
 // task watchdog). Card I/O helpers call cardYieldPoint(); for that task it
 // sleeps one tick every 50 ms. No effect on other tasks.

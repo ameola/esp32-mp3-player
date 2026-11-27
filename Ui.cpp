@@ -2385,7 +2385,7 @@ static void seekTo(uint32_t ms) {
   ms = min(ms, current.durationMs - 1000);
   const uint32_t pos = current.audioStart +
                        static_cast<uint64_t>(current.audioEnd - current.audioStart) * ms / current.durationMs;
-  audioPlay(currentPath.c_str(), pos);
+  audioPlay(currentPath.c_str(), pos, current.startCluster, current.fileSize);
   lyricShown = -2;
 }
 
@@ -2546,7 +2546,7 @@ static void startPlayback() {
   currentPath = Catalog::songPath(id);
   Serial.println("Playing " + currentPath);
   static uint32_t refusedInARow = 0;
-  if (!audioPlay(currentPath.c_str(), current.audioStart)) {
+  if (!audioPlay(currentPath.c_str(), current.audioStart, current.startCluster, current.fileSize)) {
     const char *why = audioPlayError();
     Serial.printf("  could not start playback%s%s\n", *why ? ": " : "", why);
     // Not an MP3 after all: on to the next song (once round the list at most).

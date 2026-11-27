@@ -19,6 +19,8 @@ struct Track {
   uint32_t durationMs = 0;
   uint32_t audioStart = 0;  // byte range of the MPEG audio, for elapsed time
   uint32_t audioEnd = 0;
+  uint32_t fileSize = 0;
+  uint32_t startCluster = 0;  // opens the file without a name lookup (0: by path)
 };
 
 enum JumpKind { JUMP_TITLES, JUMP_ARTISTS, JUMP_ALBUMS };

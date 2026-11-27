@@ -9,12 +9,29 @@ static size_t filBytes = sizeof(FIL);  // what cardNewFil() allocates
 void cardNoteMount() {
   FF_DIR dir;
   filBytes = sizeof(FIL);
+  capturedFs = nullptr;
   if (f_opendir(&dir, CARD_DRIVE "/") == FR_OK) {
     if (dir.obj.fs && dir.obj.fs->ssize == 512) {
       filBytes = offsetof(FIL, buf) + 512;
     }
+    capturedFs = dir.obj.fs;  // the mounted volume, for opens by cluster
     f_closedir(&dir);
   }
+}
+
+bool cardOpenCluster(FIL *fil, uint32_t startCluster, uint32_t size) {
+  if (!fil || !capturedFs || startCluster < 2 || startCluster >= capturedFs->n_fatent || size == 0) {
+    return false;
+  }
+  // Same state f_open leaves a read-only FIL in (FatFs R0.15, FF_FS_LOCK 0).
+  memset(fil, 0, offsetof(FIL, buf));  // the buffer is only read after a sector load
+  fil->obj.fs = capturedFs;
+  fil->obj.id = capturedFs->id;
+  fil->obj.attr = AM_ARC;
+  fil->obj.sclust = startCluster;
+  fil->obj.objsize = size;
+  fil->flag = FA_READ;
+  return true;
 }
 
 FIL *cardNewFil() {
@@ -92,16 +109,8 @@ bool CardFile::openCluster(uint32_t startCluster, uint32_t size) {
       return false;
     }
   }
-  // Same state f_open leaves a read-only FIL in (FatFs R0.15, FF_FS_LOCK 0).
-  memset(fil_, 0, offsetof(FIL, buf));  // the buffer is only read after a sector load
-  fil_->obj.fs = capturedFs;
-  fil_->obj.id = capturedFs->id;
-  fil_->obj.attr = AM_ARC;
-  fil_->obj.sclust = startCluster;
-  fil_->obj.objsize = size;
-  fil_->flag = FA_READ;
-  open_ = true;
-  return true;
+  open_ = cardOpenCluster(fil_, startCluster, size);
+  return open_;
 }
 
 static void *yieldTask = nullptr;
