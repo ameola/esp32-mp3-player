@@ -1,7 +1,8 @@
 #pragma once
 // Read access to the live on-card library for the UI. Records are read from
-// the card a few at a time; nothing is held in RAM. Files beyond the core
-// four are opened on first use (each open file costs ~4 KB of heap).
+// the card a few at a time until warmStep() has moved the files into PSRAM
+// (all but songs.dat). On the card, files beyond the core four are opened on
+// first use (each open file costs ~4 KB of heap).
 
 #include <Arduino.h>
 
@@ -31,6 +32,9 @@ bool open(uint32_t gen);  // opens the generation; closes any previous one
 void close();
 bool isOpen();
 uint32_t generation();
+// Moves the next library file into PSRAM (one per call, up to ~250 ms of
+// reading). True once all are there or nothing is left to do.
+bool warmStep();
 
 uint32_t songCount();   // every song file (ids 0..songCount-1)
 uint32_t titleCount();  // songs in the lists (title.idx): duplicates left out

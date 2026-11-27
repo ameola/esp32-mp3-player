@@ -77,6 +77,12 @@ public:
   // (filling from `index` if they aren't all there and fit), e.g. a folder's
   // songs before reading them twice. Otherwise a no-op.
   void prefetch(uint32_t index, uint32_t n);
+  // Reads the whole file into PSRAM and closes it on the card: from then on
+  // every read is a copy from RAM. False (and nothing changes) if there's no
+  // PSRAM for it.
+  bool loadToRam();
+  bool inRam() const { return whole_; }
+  uint32_t ramBytes() const { return whole_ ? rcap_ : 0; }
 
 private:
   FIL *fil_ = nullptr;  // heap: cardNewFil()
@@ -84,6 +90,7 @@ private:
   uint32_t rcap_ = 0, rpos_ = 0, rlen_ = 0;  // buffer holds file bytes [rpos_, rpos_ + rlen_)
   SeekIndex seek_;
   bool open_ = false;
+  bool whole_ = false;  // loadToRam(): rbuf_ holds the whole file, fil_ is closed
   LibHeader header_ = {};
 };
 

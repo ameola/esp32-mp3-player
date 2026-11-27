@@ -3,6 +3,7 @@
 #include "LibClean.h"
 #include <new>
 
+#include <esp_heap_caps.h>
 #include <esp_rom_crc.h>
 #include <algorithm>
 #include <vector>
@@ -240,7 +241,30 @@ bool LibReader::open(uint32_t gen, LibFileType type, uint16_t recordSize) {
   return true;
 }
 
+bool LibReader::loadToRam() {
+  if (whole_) return true;
+  if (!open_) return false;
+  const uint32_t size = f_size(fil_);
+  uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(std::max<uint32_t>(size, 1), MALLOC_CAP_SPIRAM));
+  UINT got = 0;
+  if (!buf || f_lseek(fil_, 0) != FR_OK || f_read(fil_, buf, size, &got) != FR_OK || got != size) {
+    free(buf);
+    return false;
+  }
+  free(rbuf_);
+  rbuf_ = buf;
+  rcap_ = rlen_ = size;
+  rpos_ = 0;
+  whole_ = true;
+  f_close(fil_);  // every read is served from RAM now
+  cardDeleteFil(fil_);
+  fil_ = nullptr;
+  seek_.clear();
+  return true;
+}
+
 void LibReader::setReadAhead(uint32_t bytes) {
+  if (whole_) return;  // already all in RAM
   if (bytes != rcap_) {
     free(rbuf_);
     rbuf_ = bytes ? static_cast<uint8_t *>(malloc(bytes)) : nullptr;
@@ -250,6 +274,7 @@ void LibReader::setReadAhead(uint32_t bytes) {
 }
 
 void LibReader::prefetch(uint32_t index, uint32_t n) {
+  if (whole_) return;
   const uint32_t offset = sizeof(LibHeader) + index * header_.recordSize;
   const uint32_t len = n * header_.recordSize;
   if (!rbuf_ || !open_ || n == 0 || len > rcap_ || index + n > header_.recordCount ||
@@ -269,15 +294,25 @@ void LibReader::prefetch(uint32_t index, uint32_t n) {
 void LibReader::close() {
   rlen_ = 0;
   seek_.clear();
-  if (open_) {
+  if (whole_) {
+    free(rbuf_);
+    rbuf_ = nullptr;
+    rcap_ = 0;
+    whole_ = false;
+  } else if (open_) {
     f_close(fil_);
-    open_ = false;
   }
+  open_ = false;
 }
 
 bool LibReader::readBytes(uint32_t offset, void *out, uint32_t len) {
   if (!open_) {
     return false;
+  }
+  if (whole_) {
+    if (offset > rlen_ || len > rlen_ - offset) return false;
+    memcpy(out, rbuf_ + offset, len);
+    return true;
   }
   cardYieldPoint();
   if (rbuf_ && len <= rcap_) {
@@ -330,6 +365,9 @@ bool LibReader::verify() {
   static uint8_t buf[2048];
   uint32_t left = header_.recordCount * header_.recordSize + header_.extraSize;
   uint32_t crc = 0;
+  if (whole_) {
+    return crc32(0, rbuf_ + sizeof(LibHeader), left) == header_.dataCrc;
+  }
   if (f_lseek(fil_, sizeof(LibHeader)) != FR_OK) {
     return false;
   }

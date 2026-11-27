@@ -34,11 +34,14 @@
 
 // ---------------------------------------------------------------- Tuning
 // LCD: ComponentTest proved 2 MHz; 8 and 16 MHz were then verified clean on
-// screen (library screen 800 -> 322 -> 242 ms after display init). Drop
-// back to 8000000 if the screen ever shows streaks, wrong colors or garbage.
+// screen (library screen 800 -> 322 -> 242 ms after display init). 40 MHz
+// (80 MHz APB / 2, the next step up from 26.7) was watched and listened to on
+// the WROVER with weak SPI drive: no streaks, no added audio noise, and an
+// artist page opens in 59 ms instead of 90. Drop back to 26670000 or
+// 16000000 if the screen ever shows streaks, wrong colors or garbage.
 // The SD card has its own clock setting on the shared bus; 20 MHz passed the
 // Bench CRC/write checks (including reads interleaved with LCD draws).
-#define LCD_SPI_HZ 16000000
+#define LCD_SPI_HZ 40000000
 #define SD_SPI_HZ 20000000
 
 // If taps land in the wrong place, flip these. Serial prints raw and

@@ -936,6 +936,7 @@ static void drawTabs() {
 struct ThumbSlot {
   uint32_t key = 0;  // 0 = free
   uint32_t used = 0;
+  uint8_t flags = 0;  // THUMB_STAND_IN
 };
 static ThumbSlot thumbSlots[THUMB_SLOTS];
 static uint16_t *thumbPixels = nullptr;  // thumbSlotCount x ART_THUMB_BYTES, while needed
@@ -969,8 +970,8 @@ static void releaseThumbs() {
 }
 
 // The thumbnail for a key, nullptr for none (or not yet, see thumbPending).
-// *missing is set when it's known not to exist.
-static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
+// *missing is set when it's known not to exist; *flags gets its store flags.
+static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing, uint8_t *flags = nullptr) {
   *missing = false;
   if (thumbPixels && thumbSlotCount != thumbSlotsWanted()) dropThumbPixels();
   if (!thumbPixels) {
@@ -998,7 +999,7 @@ static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
     for (int i = 1; i < thumbSlotCount; i++) {
       if (thumbSlots[i].used < thumbSlots[slot].used) slot = i;
     }
-    if (!thumbStore.read(key, thumbPixels + slot * (ART_THUMB * ART_THUMB))) {
+    if (!thumbStore.read(key, thumbPixels + slot * (ART_THUMB * ART_THUMB), &thumbSlots[slot].flags)) {
       thumbSlots[slot] = ThumbSlot();
       thumbMissing[thumbMissingNext] = key;
       thumbMissingNext = (thumbMissingNext + 1) % THUMB_MISSING;
@@ -1008,6 +1009,7 @@ static const uint16_t *thumbFor(uint32_t key, bool atRest, bool *missing) {
     thumbSlots[slot].key = key;
   }
   thumbSlots[slot].used = ++thumbClock;
+  if (flags) *flags = thumbSlots[slot].flags;
   return thumbPixels + slot * (ART_THUMB * ART_THUMB);
 }
 
@@ -1024,6 +1026,8 @@ struct HeroInfo {
   bool round = false;
   uint16_t icon = ICON_MUSIC_NOTE;
   uint16_t *photo = nullptr;
+  String jpg;        // JPEG still to decode (heroTick), "" for none
+  uint32_t key = 0;  // its picture key (heroCache)
 };
 static HeroInfo hero;
 
@@ -1047,6 +1051,46 @@ static void enlargeThumb(const uint16_t *src, uint16_t *dst) {
       dst[y * HERO_PHOTO + x] = uiBlend(top, bottom, ty);
     }
   }
+}
+
+// Recently decoded page pictures, in PSRAM (7.2 KB each), so going back to
+// an artist or album doesn't decode its JPEG again. Only JPEG results are
+// kept: an enlarged thumbnail is cheap and may be replaced by a download.
+// Keyed by the picture key and the background colour it was decoded over.
+#define HERO_BYTES (HERO_PHOTO * HERO_PHOTO * 2)
+#define HERO_CACHE 48
+struct HeroCacheEntry {
+  uint32_t key = 0, used = 0;
+  uint16_t bg = 0;
+  uint16_t *px = nullptr;
+};
+static HeroCacheEntry heroCache[HERO_CACHE];
+static uint32_t heroCacheClock = 0;
+
+static const uint16_t *heroCacheFind(uint32_t key, uint16_t bg) {
+  for (HeroCacheEntry &e : heroCache) {
+    if (e.px && e.key == key && e.bg == bg) {
+      e.used = ++heroCacheClock;
+      return e.px;
+    }
+  }
+  return nullptr;
+}
+
+static void heroCacheAdd(uint32_t key, uint16_t bg, const uint16_t *px) {
+  HeroCacheEntry *slot = &heroCache[0];
+  for (HeroCacheEntry &e : heroCache) {
+    if (!e.px || e.key == key) { slot = &e; break; }
+    if (e.used < slot->used) slot = &e;
+  }
+  if (!slot->px) {
+    slot->px = static_cast<uint16_t *>(heap_caps_malloc(HERO_BYTES, MALLOC_CAP_SPIRAM));
+    if (!slot->px) return;  // no PSRAM: just don't cache
+  }
+  memcpy(slot->px, px, HERO_BYTES);
+  slot->key = key;
+  slot->bg = bg;
+  slot->used = ++heroCacheClock;
 }
 
 static void loadHero(const Level &l) {
@@ -1083,18 +1127,25 @@ static void loadHero(const Level &l) {
       }
     }
   }
-  FILINFO fi;
-  if (jpg.length() && f_stat(cardPath(jpg).c_str(), &fi) == FR_OK) {
-    hero.photo = static_cast<uint16_t *>(malloc(HERO_PHOTO * HERO_PHOTO * 2));
-    if (hero.photo && !artDecodeJpeg(cardPath(jpg), hero.photo, HERO_PHOTO, pal.surface2)) {
-      free(hero.photo);
-      hero.photo = nullptr;
-    }
+  if (!key) return;
+  // A photo or cover decoded recently: no card access at all.
+  if (const uint16_t *px = heroCacheFind(key, pal.surface2)) {
+    if ((hero.photo = static_cast<uint16_t *>(malloc(HERO_BYTES)))) memcpy(hero.photo, px, HERO_BYTES);
+    return;
   }
-  if (!hero.photo && key) {
-    bool missing;
-    const uint16_t *px = thumbFor(key, true, &missing);
-    if (px && (hero.photo = static_cast<uint16_t *>(malloc(HERO_PHOTO * HERO_PHOTO * 2)))) enlargeThumb(px, hero.photo);
+  // For now the thumbnail, enlarged (one read from the open store, a few
+  // ms); the JPEG is decoded once the page is up (heroTick): finding it
+  // takes 30-40 ms and decoding 50-100 ms. A stand-in thumbnail means the
+  // artist has no photo, so there's nothing to look for. With no thumbnail
+  // at all the JPEG is still tried (it may have been copied on since the
+  // last scan).
+  bool missing;
+  uint8_t flags = 0;
+  const uint16_t *thumb = thumbFor(key, true, &missing, &flags);
+  if (thumb && (hero.photo = static_cast<uint16_t *>(malloc(HERO_BYTES)))) enlargeThumb(thumb, hero.photo);
+  if (!(thumb && (flags & THUMB_STAND_IN))) {
+    hero.jpg = jpg;
+    hero.key = key;
   }
 }
 
@@ -3158,9 +3209,11 @@ static bool sliderTouch(TouchPhase phase, int16_t x, int16_t y) {
 // it does nothing else.
 static uint32_t lastTouchAt = 0;
 static bool screenAsleep = false, swallowTouch = false;
+static bool touchDown = false;  // a finger is on the screen
 
 void uiHandleTouch(TouchPhase phase, int16_t x, int16_t y) {
   lastTouchAt = millis();
+  touchDown = phase != TOUCH_UP;
   if (screenAsleep) {
     if (phase == TOUCH_DOWN) {
       screenAsleep = false;
@@ -3278,6 +3331,29 @@ void uiLibraryChanged() {
   uiShowPlayer();
 }
 
+// The page's JPEG, after the page is drawn: replaces the enlarged thumbnail
+// (or the icon) and redraws the picture if it's on screen.
+static void heroTick() {
+  if (!hero.jpg.length() || listMoving() || nowOpen || !hasHero(level()) || hero.kind != level().kind ||
+      hero.param != level().param) {
+    return;
+  }
+  const String jpg = hero.jpg;
+  hero.jpg = "";
+  uint16_t *px = static_cast<uint16_t *>(malloc(HERO_BYTES));
+  if (!px) return;
+  if (!artDecodeJpeg(cardPath(jpg), px, HERO_PHOTO, pal.surface2)) {
+    free(px);
+    return;
+  }
+  heroCacheAdd(hero.key, pal.surface2, px);
+  free(hero.photo);
+  hero.photo = px;
+  for (int r = 0; r < 2; r++) {  // the picture spans the first two rows
+    if (level().top + r < 2) drawRow(r);
+  }
+}
+
 void uiTick() {
   const uint32_t sleepMs = uiSleepMs(uiStyle.sleep);
   if (!lastTouchAt) lastTouchAt = millis();
@@ -3322,7 +3398,10 @@ void uiTick() {
   }
 
   tickList();
+  // The library into PSRAM, a file at a time while nobody is touching.
+  if (!listMoving() && !touchDown && millis() - lastTouchAt > 300) Catalog::warmStep();
   if (!listMoving() && !nowOpen) {
+    heroTick();
     marqueeTick(listMarquee);
   }
   if (nowOpen) {

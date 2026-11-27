@@ -10,6 +10,10 @@ static uint32_t gen_ = LIB_NONE;
 static JumpTable jumps[3];
 static bool jumpLoaded[3];
 
+static bool ensure(LibReader &reader, LibFileType type, uint16_t recordSize);
+static uint8_t warmNext_ = 0;   // next file warmStep() loads
+static uint32_t warmBytes_ = 0, warmMs_ = 0;
+
 bool open(uint32_t gen) {
   close();
   if (!songs.open(gen, LF_SONGS, sizeof(SongRecord)) ||
@@ -19,6 +23,7 @@ bool open(uint32_t gen) {
     return false;
   }
   gen_ = gen;
+  warmNext_ = 0;
   return true;
 }
 
@@ -47,6 +52,37 @@ uint32_t generation() {
 // Opens a lazily-loaded file of the current generation if needed.
 static bool ensure(LibReader &reader, LibFileType type, uint16_t recordSize) {
   return reader.isOpen() || (isOpen() && reader.open(gen_, type, recordSize));
+}
+
+// Everything but songs.dat (2 MB) into PSRAM, about 0.5 MB, one file per
+// call: lists, pages and paths then never wait for the card (opening a file
+// there is a 30 ms lookup, each read a few ms). Without PSRAM they stay on
+// the card, opened on first use.
+bool warmStep() {
+  if (!isOpen()) return true;
+  struct File {
+    LibReader *reader;
+    LibFileType type;
+    uint16_t recordSize;
+  };
+  static const File files[] = {
+    {&titles, LF_TITLE_INDEX, sizeof(uint32_t)},  {&artists, LF_ARTISTS, sizeof(ArtistRecord)},
+    {&albumIdx, LF_ALBUM_INDEX, sizeof(uint32_t)}, {&albums, LF_ALBUMS, sizeof(AlbumRecord)},
+    {&folders, LF_FOLDERS, sizeof(FolderRecord)}, {&artistIdx, LF_ARTIST_INDEX, sizeof(uint32_t)},
+    {&noneIdx, LF_NONE_INDEX, sizeof(uint32_t)},  {&names, LF_NAMES, 1},
+  };
+  constexpr uint8_t n = sizeof(files) / sizeof(files[0]);
+  if (warmNext_ >= n) return true;
+  if (warmNext_ == 0) warmBytes_ = warmMs_ = 0;
+  const uint32_t t0 = millis();
+  const File &f = files[warmNext_++];
+  if (ensure(*f.reader, f.type, f.recordSize) && f.reader->loadToRam()) warmBytes_ += f.reader->ramBytes();
+  warmMs_ += millis() - t0;
+  if (warmNext_ == n) {
+    Serial.printf("[lib] %lu KB of the library in PSRAM (%lu ms of reads)\n",
+                  static_cast<unsigned long>(warmBytes_ / 1024), static_cast<unsigned long>(warmMs_));
+  }
+  return warmNext_ >= n;
 }
 
 // ---------------------------------------------------------------- Songs
